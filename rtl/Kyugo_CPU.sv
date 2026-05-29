@@ -164,7 +164,22 @@ always_ff @(posedge clk_49m) begin
 	if (!reset) mainlatch <= 8'd0;
 	else if (cen_cpu && cs_mainlatch) mainlatch[cpu1_A[2:0]] <= cpu1_Dout[0];
 end
-wire nmi_mask    = mainlatch[0];
+// DIAG-REVERT-2026-05-29: force NMI-enable AFTER sub-release to bypass the deadlock.
+//
+// v1 (= 1'b1, forced from reset) RESULT: the game's main loop ran (fg/bg writes began,
+// PC bar changed code) — proving NMI-enable gates the main loop — BUT forcing from reset
+// hijacked the main into the NMI handler BEFORE the flip/sub-release init ran, so row-2
+// ml1/ml2/cpu2 went BLACK (sub never released). Too blunt: it skipped init.
+//
+// v2 (this line): gate the force on mainlatch[2] (sub-release). At reset nmi_mask=0 so
+// init runs NORMALLY (sets flip, releases sub → ml2=1, sub goes alive). The instant the
+// sub is released, NMI force-enables — breaking the main's "released sub, now stuck
+// before OUT(0),1" deadlock at exactly the stall point, with the sub LEFT ALIVE.
+// EXPECTED if this is the bug: row-2 ml1/ml2/cpu2 cells light (init ran), row-1 nmi/
+// nmimask light, AND the game band (v_cnt 208..239) renders moving graphics.
+// Uncomment the original + delete the forced line to revert.
+// wire nmi_mask    = mainlatch[0];
+wire nmi_mask    = mainlatch[0] | mainlatch[2];   // DIAG: force NMI on once sub released
 wire flip_screen = 1'b0; // rot_flip ^ mainlatch[1];
 wire cpu2_rst    = ~mainlatch[2];
 
@@ -849,11 +864,19 @@ wire visible = ~hblk & ~vblk;
 reg cpu_m1_ever, nmi_ever, bg_wr_ever, fg_wr_ever, spr_wr_ever, nmimask_ever;
 reg [15:0] diag_a_prev;
 reg [19:0] diag_alive_cnt;
+// DIAG-REVERT-2026-05-29 (row 2): pin down WHY the main CPU never sets the LS259
+// (NMI mask). These probe the LS259 I/O writes + the sub-CPU handshake.
+reg io_wr_ever, ml1_ever, ml2_ever, cpu2_m1_ever, shared_wr_ever, gfxctrl_ever;
+reg [15:0] diag2_a_prev;
+reg [19:0] diag2_alive_cnt;
 always_ff @(posedge clk_49m) begin
     if (!reset) begin
         cpu_m1_ever <= 1'b0; nmi_ever <= 1'b0; bg_wr_ever <= 1'b0;
         fg_wr_ever  <= 1'b0; spr_wr_ever <= 1'b0; nmimask_ever <= 1'b0;
         diag_a_prev <= 16'd0; diag_alive_cnt <= 20'd0;
+        io_wr_ever <= 1'b0; ml1_ever <= 1'b0; ml2_ever <= 1'b0;
+        cpu2_m1_ever <= 1'b0; shared_wr_ever <= 1'b0; gfxctrl_ever <= 1'b0;
+        diag2_a_prev <= 16'd0; diag2_alive_cnt <= 20'd0;
     end else begin
         if (~cpu1_M1_n & ~cpu1_MREQ_n)            cpu_m1_ever  <= 1'b1;
         if (cpu1_nmi)                             nmi_ever     <= 1'b1;
@@ -864,20 +887,33 @@ always_ff @(posedge clk_49m) begin
         diag_a_prev <= cpu1_A;
         if (cpu1_A != diag_a_prev)        diag_alive_cnt <= 20'hFFFFF;
         else if (diag_alive_cnt != 20'd0) diag_alive_cnt <= diag_alive_cnt - 20'd1;
+        // Row 2 — LS259 / sub-CPU handshake
+        if (cs_mainlatch)              io_wr_ever     <= 1'b1;  // ANY OUT to ports 0-7
+        if (mainlatch[1])              ml1_ever       <= 1'b1;  // flip bit set
+        if (mainlatch[2])              ml2_ever       <= 1'b1;  // sub-CPU released
+        if (~cpu2_M1_n & ~cpu2_MREQ_n) cpu2_m1_ever   <= 1'b1;  // sub fetched opcode
+        if (cs_shared & ~cpu1_WR_n)    shared_wr_ever <= 1'b1;  // main wrote shared RAM
+        if (cs_gfxctrl)                gfxctrl_ever   <= 1'b1;  // main wrote $B000 (late init)
+        diag2_a_prev <= cpu2_A;
+        if (cpu2_A != diag2_a_prev)        diag2_alive_cnt <= 20'hFFFFF;
+        else if (diag2_alive_cnt != 20'd0) diag2_alive_cnt <= diag2_alive_cnt - 20'd1;
     end
 end
-wire cpu_alive = (diag_alive_cnt != 20'd0);
+wire cpu_alive  = (diag_alive_cnt  != 20'd0);
+wire cpu2_alive = (diag2_alive_cnt != 20'd0);
 
-wire diag_status = (v_cnt >= 9'd16) & (v_cnt < 9'd48)  & (base_h_cnt < 9'd256);
-wire diag_pcbar  = (v_cnt >= 9'd48) & (v_cnt < 9'd80);
-wire diag_swatch = (v_cnt >= 9'd80) & (v_cnt < 9'd208) & (base_h_cnt < 9'd256);
+// Row 1 = v_cnt 16..31 (original 8 cells). Row 2 = v_cnt 32..47 (NMI/LS259 probes).
+wire diag_row1  = (v_cnt >= 9'd16) & (v_cnt < 9'd32) & (base_h_cnt < 9'd256);
+wire diag_row2  = (v_cnt >= 9'd32) & (v_cnt < 9'd48) & (base_h_cnt < 9'd256);
+wire diag_pcbar = (v_cnt >= 9'd48) & (v_cnt < 9'd80);
+wire diag_swatch= (v_cnt >= 9'd80) & (v_cnt < 9'd208) & (base_h_cnt < 9'd256);
 
 wire [2:0] diag_cell = base_h_cnt[7:5];           // 0..7, 32px cells
 wire [3:0] sw_col    = base_h_cnt[7:4];           // 0..15, 16px cells
 wire [3:0] sw_row    = (v_cnt - 9'd80) >> 3;      // 0..15, 8 lines per row
 wire [7:0] diag_swatch_index = {sw_row, sw_col};
 
-// Distinct saturated cell colours; BLACK when the condition is false.
+// Row 1 (existing): distinct saturated colours; BLACK when the condition is false.
 reg [4:0] cell_r, cell_g, cell_b;
 always_comb begin
     cell_r = 5'd0; cell_g = 5'd0; cell_b = 5'd0;
@@ -893,10 +929,34 @@ always_comb begin
     endcase
 end
 
-wire       diag_direct = diag_status | diag_pcbar;
-wire [4:0] diag_r = diag_status ? cell_r : cpu1_A[15:11];   // PC bar = address bus
-wire [4:0] diag_g = diag_status ? cell_g : cpu1_A[10:6];
-wire [4:0] diag_b = diag_status ? cell_b : cpu1_A[5:1];
+// Row 2 (NEW) — NMI / LS259 / sub-CPU handshake. Same colour key as row 1:
+//   0 GREEN   io_wr_ever     — main CPU did ANY OUT to ports 0-7 (the LS259)
+//   1 CYAN    ml2_ever       — mainlatch[2] set (sub-CPU released from reset)
+//   2 BLUE    ml1_ever       — mainlatch[1] set (flip) — proves LS259 writes land
+//   3 RED     cpu2_alive     — sub-CPU address bus changing (executing)
+//   4 YELLOW  cpu2_m1_ever   — sub-CPU fetched an opcode
+//   5 MAGENTA shared_wr_ever — main CPU wrote shared RAM (talking to the sub)
+//   6 ORANGE  gfxctrl_ever   — main CPU wrote $B000 gfxctrl (reached late init)
+//   7 WHITE   calibration (always)
+reg [4:0] cell2_r, cell2_g, cell2_b;
+always_comb begin
+    cell2_r = 5'd0; cell2_g = 5'd0; cell2_b = 5'd0;
+    case (diag_cell)
+        3'd0: if (io_wr_ever)     cell2_g = 5'd31;                                  // GREEN
+        3'd1: if (ml2_ever)       begin cell2_g = 5'd31; cell2_b = 5'd31; end        // CYAN
+        3'd2: if (ml1_ever)       cell2_b = 5'd31;                                  // BLUE
+        3'd3: if (cpu2_alive)     cell2_r = 5'd31;                                  // RED
+        3'd4: if (cpu2_m1_ever)   begin cell2_r = 5'd31; cell2_g = 5'd31; end        // YELLOW
+        3'd5: if (shared_wr_ever) begin cell2_r = 5'd31; cell2_b = 5'd31; end        // MAGENTA
+        3'd6: if (gfxctrl_ever)   begin cell2_r = 5'd31; cell2_g = 5'd16; end        // ORANGE
+        3'd7:                     begin cell2_r = 5'd31; cell2_g = 5'd31; cell2_b = 5'd31; end // WHITE
+    endcase
+end
+
+wire       diag_direct = diag_row1 | diag_row2 | diag_pcbar;
+wire [4:0] diag_r = diag_row1 ? cell_r : diag_row2 ? cell2_r : cpu1_A[15:11];  // PC bar = addr bus
+wire [4:0] diag_g = diag_row1 ? cell_g : diag_row2 ? cell2_g : cpu1_A[10:6];
+wire [4:0] diag_b = diag_row1 ? cell_b : diag_row2 ? cell2_b : cpu1_A[5:1];
 
 // DIAG-REVERT-2026-05-29: original 4 assigns below, uncomment to restore
 // assign prom_addr = composite_pal;
