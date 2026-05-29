@@ -54,9 +54,18 @@ jtframe_frac_cen #(2) pix_cen (.clk(clk_49m), .n(10'd4), .m(10'd32), .cen(pix_ce
 wire cen_pix = pix_cen_o[0];
 assign ce_pix = cen_pix;
 
+// cen_cpu = 3.072 MHz CPU clock-enable (free-running /16). NOTE 2026-05-29: a phase-lock
+// experiment (cen_cpu = cen_pix & cpu_phase, to mimic real HW's single-xtal ÷6/÷3 alignment)
+// was tried to fix the boot race but REGRESSED it (couldn't reach attract) — the real root
+// cause was the NMI PULSE WIDTH (see the cpu1_nmi block), not the clock phase. Reverted to
+// the original here; phase-lock version kept commented in case a residual phase issue surfaces.
 reg [3:0] cpu_div = 4'd0;
 always_ff @(posedge clk_49m) cpu_div <= cpu_div + 4'd1;
 wire cen_cpu = (cpu_div == 4'd0);
+// PHASE-LOCK (tried 2026-05-29, regressed — see note above; re-enable only if needed):
+// reg  cpu_phase = 1'b0;
+// always_ff @(posedge clk_49m) if (cen_pix) cpu_phase <= ~cpu_phase;
+// wire cen_cpu = cen_pix & cpu_phase;
 
 reg ay_toggle = 1'b0;
 always_ff @(posedge clk_49m) if (cen_cpu) ay_toggle <= ~ay_toggle;
@@ -107,6 +116,16 @@ assign video_hsync = (h_cnt_sync >= hs_start && h_cnt_sync < hs_end);
 assign video_vsync = (v_cnt_sync >= vs_start && v_cnt_sync < vs_end);
 assign video_csync = ~(video_hsync ^ video_vsync);
 
+// DIAG-REVERT-2026-05-29 (watchdog): combined CPU-subsystem reset = power reset OR a
+// Gyrodine watchdog soft-reboot pulse (wdog_rst, driven by the watchdog block below).
+// reset_cpu feeds both Z80s + the LS259 mainlatch + NMI/IRQ state, so a watchdog timeout
+// restarts the whole main subsystem like a real board reset (RAM is NOT cleared — the
+// boot self-test re-inits it, matching hardware). KILL SWITCH: set wdog_arm = 1'b0 and
+// reset_cpu becomes identical to reset (watchdog fully neutered, no other change needed).
+wire       wdog_rst;            // forward ref — assigned in the watchdog block below
+wire       wdog_arm = 1'b0;     // DISARMED for handshake-probe debugging (stable lock to read latches); set 1'b1 to re-arm
+wire       reset_cpu = reset & ~(wdog_rst & wdog_arm);
+
 //------------------------------------------------------- CPU1 — Main ---------------------------------------------------------//
 
 wire [15:0] cpu1_A;
@@ -115,22 +134,37 @@ wire        cpu1_WR_n, cpu1_RD_n, cpu1_MREQ_n, cpu1_IORQ_n, cpu1_M1_n, cpu1_RFSH
 
 T80s cpu1
 (
-	.RESET_n(reset), .CLK(clk_49m), .CEN(cen_cpu & ~pause), .WAIT_n(1'b1),
+	.RESET_n(reset_cpu), .CLK(clk_49m), .CEN(cen_cpu & ~pause), .WAIT_n(1'b1), // reset_cpu: +watchdog
 	.INT_n(1'b1), .NMI_n(~cpu1_nmi),
 	.M1_n(cpu1_M1_n), .MREQ_n(cpu1_MREQ_n), .IORQ_n(cpu1_IORQ_n),
 	.RD_n(cpu1_RD_n), .WR_n(cpu1_WR_n), .RFSH_n(cpu1_RFSH_n),
 	.A(cpu1_A), .DI(cpu1_Din), .DO(cpu1_Dout)
 );
 
-// NMI: scanline 240, gated by nmi_mask, pulse (cleared when CPU acknowledges)
+// NMI: scanline 240, gated by nmi_mask.
+// DIAG-REVERT-2026-05-29 (NMI WIDTH): the T80 samples NMI_n for a FALLING EDGE only on CEN
+// ticks (OldNMI_n updates on CEN). A pulse narrower than one cen_cpu period can fall between
+// two CEN samples and be MISSED (see HDL/"Z80 NMI is edge-triggered sampled on CEN", surfaced
+// on Kangaroo). The OLD clear-on-M1 made the pulse phase-sensitively narrow — when v_cnt==240
+// landed next to an opcode fetch, the vblank NMI was dropped → main's NMI-driven loop stalled
+// → the boot/attract LOCK (pause/unpause re-phased the pulse wider → NMI taken → escaped).
+// FIX: hold NMI for a FIXED ~16 cen_cpu ticks so the edge is always sampled. Edge-triggered,
+// so the wide level is still exactly ONE NMI; ~16 CPU cycles releases long before next frame.
+// Original clear-on-M1 commented below.
 reg cpu1_nmi = 1'b0;
+reg [4:0] nmi_cnt = 5'd0;
 always_ff @(posedge clk_49m) begin
-	if (!reset) cpu1_nmi <= 0;
-	else begin
-		if (cen_pix && (base_h_cnt == 9'd0) && (v_cnt == 9'd240) && nmi_mask)
-			cpu1_nmi <= 1;
-		if (~cpu1_MREQ_n & ~cpu1_M1_n) cpu1_nmi <= 0;
+	if (!reset_cpu) begin cpu1_nmi <= 1'b0; nmi_cnt <= 5'd0; end  // reset_cpu: +watchdog
+	else if (cen_pix && (base_h_cnt == 9'd0) && (v_cnt == 9'd240) && nmi_mask) begin
+		cpu1_nmi <= 1'b1;
+		nmi_cnt  <= 5'd16;                         // assert + hold window (cen_cpu ticks)
+	end else if (cen_cpu && (nmi_cnt != 5'd0)) begin
+		nmi_cnt <= nmi_cnt - 5'd1;
+		if (nmi_cnt == 5'd1) cpu1_nmi <= 1'b0;     // release after ~16 cen_cpu ticks
 	end
+	// ORIGINAL (too narrow — cleared on the next opcode fetch, phase-sensitive miss):
+	// if (cen_pix && base_h_cnt==9'd0 && v_cnt==9'd240 && nmi_mask) cpu1_nmi <= 1;
+	// if (~cpu1_MREQ_n & ~cpu1_M1_n) cpu1_nmi <= 0;
 end
 
 //-------------------------------------------------- CPU1 Address Decoding (variant-aware) ------------------------------//
@@ -161,7 +195,7 @@ wire cs_mainlatch = ~cpu1_IORQ_n & ~cpu1_WR_n;                                 /
 // LS259 mainlatch (I/O port mapped, global_mask 0x07 → addr = cpu1_A[2:0])
 reg [7:0] mainlatch = 8'd0;
 always_ff @(posedge clk_49m) begin
-	if (!reset) mainlatch <= 8'd0;
+	if (!reset_cpu) mainlatch <= 8'd0;  // reset_cpu: +watchdog (a real soft-reset clears the LS259)
 	else if (cen_cpu && cs_mainlatch) mainlatch[cpu1_A[2:0]] <= cpu1_Dout[0];
 end
 // DIAG-REVERT-2026-05-29: NMI bootstrap (v3). The main loop is vblank-NMI-driven, but the
@@ -180,13 +214,49 @@ end
 // wire nmi_mask = mainlatch[0];
 reg ml0_seen = 1'b0;
 always_ff @(posedge clk_49m) begin
-	if (!reset)            ml0_seen <= 1'b0;
+	if (!reset_cpu)        ml0_seen <= 1'b0;  // reset_cpu: +watchdog (re-arm NMI bootstrap on reboot)
 	else if (mainlatch[0]) ml0_seen <= 1'b1;   // main has taken over NMI control
 end
 wire nmi_mask    = ml0_seen ? mainlatch[0]                   // game controls NMI after bootstrap
                             : (mainlatch[0] | mainlatch[2]); // bootstrap: force on after sub-release
 wire flip_screen = 1'b0; // rot_flip ^ mainlatch[1];
 wire cpu2_rst    = ~mainlatch[2];
+
+//------------------------------------------------------- Watchdog (Gyrodine) -------------------------------------------------//
+// DIAG-REVERT-2026-05-29 (watchdog): MAME gyrodine() adds WATCHDOG_TIMER; map(0xe000).w =
+// watchdog reset. A write to E000 kicks it; if the main CPU stops kicking for WDOG_TIMEOUT
+// frames, the board soft-resets (assert wdog_rst -> reset_cpu pulses both Z80s + the LS259
+// + NMI state, re-running boot). Gyrodine-only: other variants never increment so never
+// trip. Frame-clocked on the vblk rising edge (once/frame).
+//   TIMEOUT NOTE: the probe shows the main kicks E000 throughout boot (blue cell lit during
+//   the self-tests), so there is NO multi-second no-kick gap to protect — the timeout only
+//   needs to exceed the normal kick interval. 120 frames (~2 s) gives margin + fairly fast
+//   auto-retry of the attract-transition lock. Lower toward ~60 for faster retries; raise
+//   only if a legit long no-kick gap ever turns boot into a reset-loop.
+localparam [8:0] WDOG_TIMEOUT = 9'd120;   // frames w/o an E000 kick before reboot (~2 s @ 60 Hz)
+reg  [8:0] wdog_frames = 9'd0;
+reg  [9:0] wdog_pulse  = 10'd0;           // reboot-pulse length, in clk_49m cycles
+reg        wdog_vblk_d = 1'b0;
+assign     wdog_rst    = (wdog_pulse != 10'd0);
+always_ff @(posedge clk_49m) begin
+	if (!reset) begin
+		wdog_frames <= 9'd0; wdog_pulse <= 10'd0; wdog_vblk_d <= 1'b0;
+	end else begin
+		wdog_vblk_d <= vblk;
+		if (wdog_rst) begin
+			wdog_pulse  <= wdog_pulse - 10'd1;     // hold reset, count the pulse down
+			wdog_frames <= 9'd0;
+		end else if (cs_watchdog & ~cpu1_WR_n) begin
+			wdog_frames <= 9'd0;                    // kicked
+		end else if (vblk & ~wdog_vblk_d & (variant_sel == VAR_GYRO)) begin
+			if (wdog_frames >= WDOG_TIMEOUT) begin
+				wdog_pulse  <= 10'h3FF;             // FIRE: ~1023 clk reset pulse (many cen_cpu)
+				wdog_frames <= 9'd0;
+			end else
+				wdog_frames <= wdog_frames + 9'd1;
+		end
+	end
+end
 
 //------------------------------------------------------- CPU2 — Sub ----------------------------------------------------------//
 
@@ -196,7 +266,7 @@ wire        cpu2_WR_n, cpu2_RD_n, cpu2_MREQ_n, cpu2_IORQ_n, cpu2_M1_n, cpu2_RFSH
 
 T80pa cpu2
 (
-	.RESET_n(reset & ~cpu2_rst), .CLK(clk_49m),
+	.RESET_n(reset_cpu & ~cpu2_rst), .CLK(clk_49m),  // reset_cpu: +watchdog
 	.CEN_p(cen_cpu & ~pause), .CEN_n(~cen_cpu & ~pause),
 	.WAIT_n(1'b1),
 	.INT_n(~cpu2_irq), .NMI_n(1'b1),
@@ -208,7 +278,7 @@ T80pa cpu2
 // Sub IRQ: 4x per frame at (scanline & 0x3F) == 0x20 (scanlines 32, 96, 160, 224)
 reg cpu2_irq = 1'b0;
 always_ff @(posedge clk_49m) begin
-	if (!reset || cpu2_rst) cpu2_irq <= 0;
+	if (!reset_cpu || cpu2_rst) cpu2_irq <= 0;  // reset_cpu: +watchdog
 	else begin
 		if (cen_pix && (base_h_cnt == 9'd0) && (v_cnt[5:0] == 6'h20))
 			cpu2_irq <= 1;
@@ -994,14 +1064,166 @@ always_comb begin
 end
 wire diag_strip = (v_cnt >= 9'd16) & (v_cnt < 9'd24) & (base_h_cnt < 9'd256);
 
+//------------------------------------------------------------------------
+// DIAG-REVERT-2026-05-29 (LOCK PROBE): read the HUNG main-CPU state.
+// The "ever" cells above all latched TRUE at boot, so they say nothing about a
+// mid-game lock. These cells are RECENT-ACTIVITY WINDOWS instead: each reloads on
+// its event and DECAYS over ~0.68 s @ clk_49m. Play until it hard-locks, then
+// screenshot the FROZEN frame — a cell that is now BLACK = that activity STOPPED at
+// the lock; a cell still lit = it's ongoing. Cells at v_cnt 16..31, PC bar 32..63.
+//
+//   0 GREEN   main vblank-NMI fired recently   (main game-loop heartbeat)
+//   1 CYAN    main wrote VRAM recently          (still drawing)
+//   2 BLUE    main kicked watchdog E000 recently(still in its main loop)
+//   3 RED     main READ shared RAM recently     (polling the sub = handshake wait)
+//   4 YELLOW  sub WROTE shared RAM recently     (sub still responding)
+//   5 MAGENTA sub CPU executing recently        (sound side alive — expect lit)
+//   6 ORANGE  nmi_mask is HIGH right NOW (LIVE)  (is the main's NMI even enabled?)
+//   7 WHITE   calibration (always on)
+//
+// DECISION TREE (read at the lock):
+//   6 ORANGE BLACK  -> NMI is masked OFF now: main starved of its vblank IRQ ->
+//                      game loop can't run. Prime v3-bandaid suspect (game cleared
+//                      mainlatch[0] at BG setup, never re-set; ml0_seen already
+//                      latched so v3 follows the real bit -> NMI dies). FIX = NMI path.
+//   6 ORANGE LIT but 0 GREEN BLACK -> NMI enabled but not firing/landing -> NMI-gen
+//                      or the CPU is HALTed/wedged below the IRQ. Check PC bar.
+//   0/1/2 all dark, 3 RED LIT -> main spinning, reading shared RAM = handshake spin.
+//                      Then 4 YELLOW: dark = sub stalled its half; lit = main waits on
+//                      a SPECIFIC value the sub isn't producing. (a real cpu1<->cpu2 sync)
+//   3 RED dark too + 0/1/2 dark -> spinning on non-shared-RAM (or crashed) -> PC bar.
+//   PC bar (v_cnt 32..63, RGB=cpu1_A): solid 1 colour=HALT/tight park; few stable
+//      stripes=small loop; wide noisy=wandering/crash. Dominant hue's red chan =
+//      cpu1_A[15:11]: low/dark = ROM (<0x8000), bright = RAM/IO region (ran off).
+// REVERT: delete this block + restore the assign lines below (see their DIAG tag).
+//------------------------------------------------------------------------
+localparam [24:0] LP_WIN = 25'h1FFFFFF;   // ~0.68 s recent-activity window
+reg [24:0] lp_nmi, lp_vramwr, lp_wdog, lp_shrd, lp_subwr, lp_cpu2;
+reg [15:0] lp_a1_prev, lp_a2_prev;
+always_ff @(posedge clk_49m) begin
+    if (!reset) begin
+        lp_nmi<=0; lp_vramwr<=0; lp_wdog<=0; lp_shrd<=0; lp_subwr<=0; lp_cpu2<=0;
+        lp_a1_prev<=16'd0; lp_a2_prev<=16'd0;
+    end else begin
+        lp_a1_prev <= cpu1_A; lp_a2_prev <= cpu2_A;
+        if (cpu1_nmi)                                                 lp_nmi    <= LP_WIN; else if (lp_nmi)    lp_nmi    <= lp_nmi    - 1'b1;
+        if ((cs_bgvram|cs_fgvram|cs_spram0|cs_spram1) & ~cpu1_WR_n)   lp_vramwr <= LP_WIN; else if (lp_vramwr) lp_vramwr <= lp_vramwr - 1'b1;
+        if (cs_watchdog & ~cpu1_WR_n)                                 lp_wdog   <= LP_WIN; else if (lp_wdog)   lp_wdog   <= lp_wdog   - 1'b1;
+        if (cs_shared & ~cpu1_RD_n)                                   lp_shrd   <= LP_WIN; else if (lp_shrd)   lp_shrd   <= lp_shrd   - 1'b1;
+        if (cs2_shared & ~cpu2_WR_n)                                  lp_subwr  <= LP_WIN; else if (lp_subwr)  lp_subwr  <= lp_subwr  - 1'b1;
+        if (cpu2_A != lp_a2_prev)                                     lp_cpu2   <= LP_WIN; else if (lp_cpu2)   lp_cpu2   <= lp_cpu2   - 1'b1;
+    end
+end
+wire lp_nmi_act    = (lp_nmi    != 0);
+wire lp_vramwr_act = (lp_vramwr != 0);
+wire lp_wdog_act   = (lp_wdog   != 0);
+wire lp_shrd_act   = (lp_shrd   != 0);
+wire lp_subwr_act  = (lp_subwr  != 0);
+wire lp_cpu2_act   = (lp_cpu2   != 0);
+
+reg [4:0] lpc_r, lpc_g, lpc_b;
+always_comb begin
+    lpc_r = 5'd0; lpc_g = 5'd0; lpc_b = 5'd0;
+    case (diag_cell)
+        3'd0: if (lp_nmi_act)    lpc_g = 5'd31;                                  // GREEN
+        3'd1: if (lp_vramwr_act) begin lpc_g = 5'd31; lpc_b = 5'd31; end          // CYAN
+        3'd2: if (lp_wdog_act)   lpc_b = 5'd31;                                  // BLUE
+        3'd3: if (lp_shrd_act)   lpc_r = 5'd31;                                  // RED
+        3'd4: if (lp_subwr_act)  begin lpc_r = 5'd31; lpc_g = 5'd31; end          // YELLOW
+        3'd5: if (lp_cpu2_act)   begin lpc_r = 5'd31; lpc_b = 5'd31; end          // MAGENTA
+        3'd6: if (nmi_mask)      begin lpc_r = 5'd31; lpc_g = 5'd16; end          // ORANGE (LIVE level)
+        3'd7:                    begin lpc_r = 5'd31; lpc_g = 5'd31; lpc_b = 5'd31; end // WHITE
+    endcase
+end
+wire       diag_lp_cells = (v_cnt >= 9'd16) & (v_cnt < 9'd32) & (base_h_cnt < 9'd256);
+wire       diag_lp_pcbar = (v_cnt >= 9'd32) & (v_cnt < 9'd64) & (base_h_cnt < 9'd256);
+wire       diag_lp       = diag_lp_cells | diag_lp_pcbar;
+wire [4:0] lp_r = diag_lp_cells ? lpc_r : cpu1_A[15:11];   // PC bar = main addr bus
+wire [4:0] lp_g = diag_lp_cells ? lpc_g : cpu1_A[10:6];
+wire [4:0] lp_b = diag_lp_cells ? lpc_b : cpu1_A[5:1];
+
+//------------------------------------------------------------------------
+// DIAG-REVERT-2026-05-29 (HANDSHAKE PROBE): pin the exact main<->sub shared-RAM
+// handshake at the deterministic self-test->attract lock. Watchdog DISARMED so the lock
+// is permanent and these latches hold. Each row is a 16-bit value, MSB at the LEFT, 16
+// cells (16px each): lit cell = 1, dark = 0. Read each row L->R as binary (4 nibbles).
+//   v_cnt 16..23  WHITE   calibration (all 16 lit = probe live + rbf fresh)
+//   v_cnt 24..31  GREEN   poll_addr = last shared-RAM offset the MAIN read  (bits[10:0]; abs = F000+offset)
+//   v_cnt 32..39  CYAN    poll_val  = value the MAIN read there             (bits[7:0])
+//   v_cnt 40..47  YELLOW  subw_addr = last shared-RAM offset the SUB wrote  (bits[10:0]; abs = 4000+offset)
+//   v_cnt 48..55  MAGENTA subw_val  = value the SUB wrote there             (bits[7:0])
+//   v_cnt 56..63  ORANGE  spin_pc   = main cpu1_A at last opcode fetch (the spin PC; flickers within the loop)
+// READ: poll_addr==subw_addr => main & sub share the same byte (value/timing issue);
+//   differ => main waits on a byte the sub never writes (protocol/addr bug). poll_val is
+//   what the main keeps seeing (vs the value it wants — from disasm). spin_pc's stable
+//   upper bits = the ROM page to disassemble; low bits flicker over the loop body.
+// REVERT: delete this block + restore an assign triplet below.
+//------------------------------------------------------------------------
+reg [10:0] hs_poll_addr; reg [7:0] hs_poll_val;
+reg [10:0] hs_subw_addr; reg [7:0] hs_subw_val;
+reg [15:0] hs_spin_pc;
+always_ff @(posedge clk_49m) begin
+    if (!reset) begin
+        hs_poll_addr<=11'd0; hs_poll_val<=8'd0;
+        hs_subw_addr<=11'd0; hs_subw_val<=8'd0; hs_spin_pc<=16'd0;
+    end else begin
+        if (cs_shared  & ~cpu1_RD_n)   begin hs_poll_addr <= cpu1_A[10:0]; hs_poll_val <= shared_ram_D_cpu1; end
+        if (cs2_shared & ~cpu2_WR_n)   begin hs_subw_addr <= cpu2_A[10:0]; hs_subw_val <= cpu2_Dout;        end
+        if (~cpu1_M1_n & ~cpu1_MREQ_n) hs_spin_pc <= cpu1_A;
+    end
+end
+wire [3:0]  hs_cell    = base_h_cnt[7:4];
+wire [3:0]  hs_bitsel  = 4'd15 - hs_cell;          // MSB (bit 15) at the leftmost cell
+wire [15:0] hs_v_paddr = {5'd0, hs_poll_addr};
+wire [15:0] hs_v_pval  = {8'd0, hs_poll_val};
+wire [15:0] hs_v_saddr = {5'd0, hs_subw_addr};
+wire [15:0] hs_v_sval  = {8'd0, hs_subw_val};
+wire [15:0] hs_v_pc    = hs_spin_pc;
+wire hs_row_calib = (v_cnt>=9'd16)&(v_cnt<9'd24);
+wire hs_row_paddr = (v_cnt>=9'd24)&(v_cnt<9'd32);
+wire hs_row_pval  = (v_cnt>=9'd32)&(v_cnt<9'd40);
+wire hs_row_saddr = (v_cnt>=9'd40)&(v_cnt<9'd48);
+wire hs_row_sval  = (v_cnt>=9'd48)&(v_cnt<9'd56);
+wire hs_row_pc    = (v_cnt>=9'd56)&(v_cnt<9'd64);
+wire hs_active = (hs_row_calib|hs_row_paddr|hs_row_pval|hs_row_saddr|hs_row_sval|hs_row_pc) & (base_h_cnt<9'd256);
+reg [4:0] hs_r, hs_g, hs_b;
+always_comb begin
+    hs_r=5'd0; hs_g=5'd0; hs_b=5'd0;
+    if (hs_row_calib)                         begin hs_r=5'd31; hs_g=5'd31; hs_b=5'd31; end // WHITE
+    if (hs_row_paddr & hs_v_paddr[hs_bitsel]) hs_g=5'd31;                                   // GREEN
+    if (hs_row_pval  & hs_v_pval[hs_bitsel])  begin hs_g=5'd31; hs_b=5'd31; end              // CYAN
+    if (hs_row_saddr & hs_v_saddr[hs_bitsel]) begin hs_r=5'd31; hs_g=5'd31; end              // YELLOW
+    if (hs_row_sval  & hs_v_sval[hs_bitsel])  begin hs_r=5'd31; hs_b=5'd31; end              // MAGENTA
+    if (hs_row_pc    & hs_v_pc[hs_bitsel])    begin hs_r=5'd31; hs_g=5'd16; end              // ORANGE
+end
+
 // DIAG-2026-05-29: full overlay OFF (game running); only the THIN ROW-3 STRIP (v_cnt
 // 16..23) is overlaid so we keep the picture AND read the sub-handshake. Restore the
 // pristine render = drop `diag_strip ? strip_* :` from the 3 lines below. Re-arm the FULL
 // overlay = use the 4 fully-commented lines at the very bottom instead.
+// DIAG-REVERT-2026-05-29: video output mux — THREE options, exactly ONE triplet active.
+//   (1) PRISTINE: clean game render, no overlay (use for a pure "does it lock?" test).
+//   (2) LOCK PROBE (ACTIVE): overlays recent-activity cells (v_cnt 16..31) + PC bar
+//       (32..63) to read WHERE the main CPU is stuck during a lock. Independent of the
+//       hiscore disable — if it still locks, the cells tell us where, no second compile.
+//   (3) STRIP (old committed): sub-handshake strip on the live game.
 assign prom_addr = composite_pal;
-assign red   = !visible ? 5'd0 : diag_strip ? strip_r : {prom_r_D[3:0], prom_r_D[3]};
-assign green = !visible ? 5'd0 : diag_strip ? strip_g : {prom_g_D[3:0], prom_g_D[3]};
-assign blue  = !visible ? 5'd0 : diag_strip ? strip_b : {prom_b_D[3:0], prom_b_D[3]};
+// (1) PRISTINE — ACTIVE (clean video for the phase-fix boot→attract test):
+assign red   = !visible ? 5'd0 : {prom_r_D[3:0], prom_r_D[3]};
+assign green = !visible ? 5'd0 : {prom_g_D[3:0], prom_g_D[3]};
+assign blue  = !visible ? 5'd0 : {prom_b_D[3:0], prom_b_D[3]};
+// (2) LOCK PROBE — swap in to re-arm:
+// assign red   = !visible ? 5'd0 : diag_lp ? lp_r : {prom_r_D[3:0], prom_r_D[3]};
+// assign green = !visible ? 5'd0 : diag_lp ? lp_g : {prom_g_D[3:0], prom_g_D[3]};
+// assign blue  = !visible ? 5'd0 : diag_lp ? lp_b : {prom_b_D[3:0], prom_b_D[3]};
+// (4) HANDSHAKE PROBE — swap in to re-arm (binary rows of the main<->sub handshake):
+// assign red   = !visible ? 5'd0 : hs_active ? hs_r : {prom_r_D[3:0], prom_r_D[3]};
+// assign green = !visible ? 5'd0 : hs_active ? hs_g : {prom_g_D[3:0], prom_g_D[3]};
+// assign blue  = !visible ? 5'd0 : hs_active ? hs_b : {prom_b_D[3:0], prom_b_D[3]};
+// (3) STRIP (old) — sub-handshake strip on live game:
+// assign red   = !visible ? 5'd0 : diag_strip ? strip_r : {prom_r_D[3:0], prom_r_D[3]};
+// assign green = !visible ? 5'd0 : diag_strip ? strip_g : {prom_g_D[3:0], prom_g_D[3]};
+// assign blue  = !visible ? 5'd0 : diag_strip ? strip_b : {prom_b_D[3:0], prom_b_D[3]};
 // Full-overlay drive (DISABLED — swap with the 4 lines above to re-arm rows 1/2/PC/swatch):
 // assign prom_addr = diag_swatch ? diag_swatch_index : composite_pal;
 // assign red   = !visible ? 5'd0 : diag_direct ? diag_r : {prom_r_D[3:0], prom_r_D[3]};

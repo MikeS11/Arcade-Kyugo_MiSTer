@@ -408,7 +408,11 @@ pause #(8,8,8,49) pause
 	.*,
 	.clk_sys(CLK_49M),
 	.user_button(m_pause),
-	.pause_request(hs_pause),
+	// DIAG-REVERT-2026-05-29 (hiscore disabled): hiscore drives hs_pause -> pause_request,
+	// which pauses BOTH Z80s. A stuck hiscore pause = hard lock (known past offender; the
+	// Gyrodine HS RAM region is unidentified). Cut the path so hiscore can't freeze the CPUs.
+	// .pause_request(hs_pause),
+	.pause_request(1'b0),
 	.options(~status[26:25])
 );
 
@@ -520,7 +524,11 @@ Kyugo kyugo_inst
 	.hs_address(hs_address),
 	.hs_data_out(hs_data_out),
 	.hs_data_in(hs_data_in),
-	.hs_write(hs_write_enable)
+	// DIAG-REVERT-2026-05-29 (hiscore disabled): hs_write hijacks port A of the SHARED RAM
+	// (the main<->sub handshake region — hiscore is wired only to shared_ram here). Force 0
+	// so hiscore can never write/corrupt the handshake. Restore = .hs_write(hs_write_enable).
+	// .hs_write(hs_write_enable)
+	.hs_write(1'b0)
 );
 
 // HISCORE SYSTEM
