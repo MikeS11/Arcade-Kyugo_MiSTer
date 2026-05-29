@@ -812,12 +812,102 @@ wire       fg_opaque          = (fg_pix != 2'b00);
 wire [7:0] composite_pal = spr_opaque ? spr_palette_index :
                            fg_opaque  ? fg_palette_index  :
                                         bg_palette_index;
-assign prom_addr = composite_pal;
-
 // 1-clk_49m latency through palette PROMs. 4-bit channel → 5-bit by replicating MSB.
 wire visible = ~hblk & ~vblk;
-assign red   = visible ? {prom_r_D[3:0], prom_r_D[3]} : 5'd0;
-assign green = visible ? {prom_g_D[3:0], prom_g_D[3]} : 5'd0;
-assign blue  = visible ? {prom_b_D[3:0], prom_b_D[3]} : 5'd0;
+
+//========================================================================
+// DIAG-REVERT-2026-05-29: video-state diagnostic overlay   >>> DIAGNOSTIC >>>
+// Display path is confirmed good (force-color test), so we use it as a scope.
+// One screenshot tells us which render stage is dead. Regions, top of image:
+//
+//   v_cnt 16..47 : 8 STATUS CELLS, 32px each (base_h_cnt 0..255). Each cell is
+//                  its DISTINCT colour when its sticky condition is TRUE, else
+//                  BLACK (no greys):
+//     cell0 GREEN   cpu_alive    — Z80 address bus is changing (executing)
+//     cell1 CYAN    cpu_m1_ever  — Z80 fetched at least one opcode
+//     cell2 BLUE    nmi_ever     — the vblank NMI has fired
+//     cell3 RED     bg_wr_ever   — CPU has written bgvram
+//     cell4 YELLOW  fg_wr_ever   — CPU has written fgvram
+//     cell5 MAGENTA spr_wr_ever  — CPU has written sprite RAM
+//     cell6 ORANGE  nmimask_ever — mainlatch[0] (NMI enable) has been set
+//     cell7 WHITE   calibration  — ALWAYS on (proves overlay renders + rbf fresh)
+//   v_cnt 48..79 : CPU-PC BAR — RGB straight from cpu1_A. Noisy stipple = Z80
+//                  executing across many addresses; a solid block = stuck/halted.
+//   v_cnt 80..207: PALETTE SWATCH — 16x16 grid, prom_addr forced to the cell
+//                  index, shown via the normal PROM path. Real colours = palette
+//                  PROM good; all-black = palette empty/black (look at PROM load).
+//   v_cnt 208..239: untouched normal game render.
+//
+// READING IT: cell7 white but cell0 black -> Z80 halted (root cause).
+//   cell0 green but cell3/4 black -> CPU runs but never writes VRAM (stuck in
+//   init / waiting). cells green + swatch colourful + game area still black ->
+//   renderer bug. swatch all black -> palette PROM is the problem.
+//
+// REVERT: delete this whole block + the 4 DIAG assigns, uncomment the 4
+// originals just below. (The sticky-latch always_ff is harmless if left.)
+//========================================================================
+reg cpu_m1_ever, nmi_ever, bg_wr_ever, fg_wr_ever, spr_wr_ever, nmimask_ever;
+reg [15:0] diag_a_prev;
+reg [19:0] diag_alive_cnt;
+always_ff @(posedge clk_49m) begin
+    if (!reset) begin
+        cpu_m1_ever <= 1'b0; nmi_ever <= 1'b0; bg_wr_ever <= 1'b0;
+        fg_wr_ever  <= 1'b0; spr_wr_ever <= 1'b0; nmimask_ever <= 1'b0;
+        diag_a_prev <= 16'd0; diag_alive_cnt <= 20'd0;
+    end else begin
+        if (~cpu1_M1_n & ~cpu1_MREQ_n)            cpu_m1_ever  <= 1'b1;
+        if (cpu1_nmi)                             nmi_ever     <= 1'b1;
+        if (cs_bgvram & ~cpu1_WR_n)               bg_wr_ever   <= 1'b1;
+        if (cs_fgvram & ~cpu1_WR_n)               fg_wr_ever   <= 1'b1;
+        if ((cs_spram0 | cs_spram1) & ~cpu1_WR_n) spr_wr_ever  <= 1'b1;
+        if (nmi_mask)                             nmimask_ever <= 1'b1;
+        diag_a_prev <= cpu1_A;
+        if (cpu1_A != diag_a_prev)        diag_alive_cnt <= 20'hFFFFF;
+        else if (diag_alive_cnt != 20'd0) diag_alive_cnt <= diag_alive_cnt - 20'd1;
+    end
+end
+wire cpu_alive = (diag_alive_cnt != 20'd0);
+
+wire diag_status = (v_cnt >= 9'd16) & (v_cnt < 9'd48)  & (base_h_cnt < 9'd256);
+wire diag_pcbar  = (v_cnt >= 9'd48) & (v_cnt < 9'd80);
+wire diag_swatch = (v_cnt >= 9'd80) & (v_cnt < 9'd208) & (base_h_cnt < 9'd256);
+
+wire [2:0] diag_cell = base_h_cnt[7:5];           // 0..7, 32px cells
+wire [3:0] sw_col    = base_h_cnt[7:4];           // 0..15, 16px cells
+wire [3:0] sw_row    = (v_cnt - 9'd80) >> 3;      // 0..15, 8 lines per row
+wire [7:0] diag_swatch_index = {sw_row, sw_col};
+
+// Distinct saturated cell colours; BLACK when the condition is false.
+reg [4:0] cell_r, cell_g, cell_b;
+always_comb begin
+    cell_r = 5'd0; cell_g = 5'd0; cell_b = 5'd0;
+    case (diag_cell)
+        3'd0: if (cpu_alive)    cell_g = 5'd31;                                  // GREEN
+        3'd1: if (cpu_m1_ever)  begin cell_g = 5'd31; cell_b = 5'd31; end        // CYAN
+        3'd2: if (nmi_ever)     cell_b = 5'd31;                                  // BLUE
+        3'd3: if (bg_wr_ever)   cell_r = 5'd31;                                  // RED
+        3'd4: if (fg_wr_ever)   begin cell_r = 5'd31; cell_g = 5'd31; end        // YELLOW
+        3'd5: if (spr_wr_ever)  begin cell_r = 5'd31; cell_b = 5'd31; end        // MAGENTA
+        3'd6: if (nmimask_ever) begin cell_r = 5'd31; cell_g = 5'd16; end        // ORANGE
+        3'd7:                   begin cell_r = 5'd31; cell_g = 5'd31; cell_b = 5'd31; end // WHITE (calib)
+    endcase
+end
+
+wire       diag_direct = diag_status | diag_pcbar;
+wire [4:0] diag_r = diag_status ? cell_r : cpu1_A[15:11];   // PC bar = address bus
+wire [4:0] diag_g = diag_status ? cell_g : cpu1_A[10:6];
+wire [4:0] diag_b = diag_status ? cell_b : cpu1_A[5:1];
+
+// DIAG-REVERT-2026-05-29: original 4 assigns below, uncomment to restore
+// assign prom_addr = composite_pal;
+// assign red   = visible ? {prom_r_D[3:0], prom_r_D[3]} : 5'd0;
+// assign green = visible ? {prom_g_D[3:0], prom_g_D[3]} : 5'd0;
+// assign blue  = visible ? {prom_b_D[3:0], prom_b_D[3]} : 5'd0;
+assign prom_addr = diag_swatch ? diag_swatch_index : composite_pal;
+assign red   = !visible ? 5'd0 : diag_direct ? diag_r : {prom_r_D[3:0], prom_r_D[3]};
+assign green = !visible ? 5'd0 : diag_direct ? diag_g : {prom_g_D[3:0], prom_g_D[3]};
+assign blue  = !visible ? 5'd0 : diag_direct ? diag_b : {prom_b_D[3:0], prom_b_D[3]};
+// DIAG-REVERT-2026-05-29: video-state diagnostic overlay   <<< END DIAGNOSTIC <<<
+//========================================================================
 
 endmodule

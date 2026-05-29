@@ -51,9 +51,17 @@
 		<part crc="4e9323bd" name="a21.03"/>
 		<part crc="57e659d4" name="a21.04"/>
 		<part crc="1e7293f3" name="a21.05"/>
-		<!-- Sub CPU 16KB region (8KB ROM + 8KB pad) -->
+		<!-- Sub CPU 32KB region (8KB ROM + 24KB pad).
+		     FIX 2026-05-29: the selector (rom_loader.sv) reserves 0x08000-0x0FFFF
+		     (32KB) for sub_rom so the larger sub ROMs of Repulse/Flashgal/
+		     SRDMission/Legend fit the shared layout. Gyrodine's sub is only 8KB,
+		     so it MUST be padded to the full 32KB here. The old 8KB pad made this
+		     region only 16KB, shifting fg/bg/sprite/color-PROMs all 16KB early —
+		     the color PROMs fell off the end of the blob, so prom_r/g/b loaded
+		     ZEROS => empty palette => whole screen black. Found via the palette-
+		     swatch diagnostic (swatch read all-black). -->
 		<part crc="b2ce0aa2" name="a21.01"/>
-		<part repeat="8192"> 00 </part>
+		<part repeat="24576"> 00 </part>
 		<!-- FG 4KB -->
 		<part crc="adba18d0" name="a21.15"/>
 		<!-- BG plane 0 16KB region (8KB ROM + 8KB pad) -->
