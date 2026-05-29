@@ -334,7 +334,33 @@ assign cfg_write = 0;
 assign cfg_address = 0;
 assign cfg_data = 0;
 
-wire reset = RESET | status[0] | buttons[1] | ioctl_download;
+// DIAG-REVERT-2026-05-29 (PLL-lock reset + AUTO SECOND-RESET):
+//  (a) `| ~locked` holds the CPUs in reset until the PLL is locked (kept — correct hardware).
+//  (b) AUTO SECOND-RESET: a cold boot deterministically sits on "SUB CHECK FFFF" until a manual
+//      soft reset. The watchdog can't recover it — the self-test keeps KICKING the watchdog while
+//      it waits on the sub, so the dog never times out. So automate the known-good manual soft
+//      reset: a ONE-SHOT that asserts a full reset ~4s after the first reset releases. SAFE: cold
+//      boot never self-succeeds, so the one-shot can only ever kick an already-failed boot, never
+//      a good one. RAM is preserved (no re-download) = exactly the manual soft reset. Armed once
+//      per power-on (RESET). TUNE ASR_AT: must be > time-to-reach-SUB-CHECK; lower for faster boot.
+//      Revert = `wire reset = reset_base;` and delete the FSM.
+wire reset_base = RESET | status[0] | buttons[1] | ioctl_download | ~locked;
+localparam [27:0] ASR_AT = 28'd200_000_000;     // ~4.07 s @ 49.152 MHz (after SUB CHECK has failed)
+reg  [27:0] asr_cnt   = 28'd0;
+reg         asr_pulse = 1'b0;
+reg         asr_done  = 1'b0;
+always_ff @(posedge CLK_49M) begin
+    if (RESET) begin                              // hard power-on / core (re)load: arm the one-shot
+        asr_cnt <= 28'd0; asr_pulse <= 1'b0; asr_done <= 1'b0;
+    end else if (reset_base) begin
+        asr_cnt <= 28'd0;                         // hold off while any base reset is active
+    end else if (!asr_done) begin
+        asr_cnt <= asr_cnt + 28'd1;
+        if (asr_cnt == ASR_AT)                  asr_pulse <= 1'b1;                          // fire auto soft-reset
+        if (asr_cnt == ASR_AT + 28'd500_000) begin asr_pulse <= 1'b0; asr_done <= 1'b1; end // ~10ms pulse, then one-shot done
+    end
+end
+wire reset = reset_base | asr_pulse;
 
 ///////////////////         Keyboard           //////////////////
 

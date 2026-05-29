@@ -123,7 +123,7 @@ assign video_csync = ~(video_hsync ^ video_vsync);
 // boot self-test re-inits it, matching hardware). KILL SWITCH: set wdog_arm = 1'b0 and
 // reset_cpu becomes identical to reset (watchdog fully neutered, no other change needed).
 wire       wdog_rst;            // forward ref — assigned in the watchdog block below
-wire       wdog_arm = 1'b0;     // DISARMED for handshake-probe debugging (stable lock to read latches); set 1'b1 to re-arm
+wire       wdog_arm = 1'b1;     // RE-ARMED: auto-recovers the cold-boot SUB-CHECK lock (main stops kicking E000 → ~2s → RAM-preserving reset → retry passes, like a manual light reset). Set 1'b0 to disable.
 wire       reset_cpu = reset & ~(wdog_rst & wdog_arm);
 
 //------------------------------------------------------- CPU1 — Main ---------------------------------------------------------//
