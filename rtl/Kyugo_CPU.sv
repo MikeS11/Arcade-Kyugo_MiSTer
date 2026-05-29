@@ -164,22 +164,27 @@ always_ff @(posedge clk_49m) begin
 	if (!reset) mainlatch <= 8'd0;
 	else if (cen_cpu && cs_mainlatch) mainlatch[cpu1_A[2:0]] <= cpu1_Dout[0];
 end
-// DIAG-REVERT-2026-05-29: force NMI-enable AFTER sub-release to bypass the deadlock.
-//
-// v1 (= 1'b1, forced from reset) RESULT: the game's main loop ran (fg/bg writes began,
-// PC bar changed code) — proving NMI-enable gates the main loop — BUT forcing from reset
-// hijacked the main into the NMI handler BEFORE the flip/sub-release init ran, so row-2
-// ml1/ml2/cpu2 went BLACK (sub never released). Too blunt: it skipped init.
-//
-// v2 (this line): gate the force on mainlatch[2] (sub-release). At reset nmi_mask=0 so
-// init runs NORMALLY (sets flip, releases sub → ml2=1, sub goes alive). The instant the
-// sub is released, NMI force-enables — breaking the main's "released sub, now stuck
-// before OUT(0),1" deadlock at exactly the stall point, with the sub LEFT ALIVE.
-// EXPECTED if this is the bug: row-2 ml1/ml2/cpu2 cells light (init ran), row-1 nmi/
-// nmimask light, AND the game band (v_cnt 208..239) renders moving graphics.
-// Uncomment the original + delete the forced line to revert.
-// wire nmi_mask    = mainlatch[0];
-wire nmi_mask    = mainlatch[0] | mainlatch[2];   // DIAG: force NMI on once sub released
+// DIAG-REVERT-2026-05-29: NMI bootstrap (v3). The main loop is vblank-NMI-driven, but the
+// main can't reach its own OUT(0),1 (set mainlatch[0]=NMI-enable) until a cpu1<->cpu2
+// shared-RAM handshake completes — and that handshake needs the NMI loop already running
+// => a boot deadlock. Evolution:
+//   v1 (= 1'b1): forced from reset — broke the deadlock but skipped flip/sub-release init.
+//   v2 (= mainlatch[0]|mainlatch[2]): forced after sub-release — boots + video + audio all
+//       work, BUT it keeps NMI on FOREVER; the game clears mainlatch[0] during attract
+//       VRAM setup and the forced NMI corrupts it => garbage tiles + lock at attract.
+//   v3 (below): force ONLY as a bootstrap, then hand control back. The strip probe proved
+//       the main DOES set mainlatch[0] itself (ml0 cell black->blue) and the sub DOES
+//       write shared RAM. So once the main has taken NMI control (ml0_seen), follow the
+//       REAL mainlatch[0] — letting the game disable NMI when it needs to.
+// Revert = restore `wire nmi_mask = mainlatch[0];` and delete the ml0_seen latch.
+// wire nmi_mask = mainlatch[0];
+reg ml0_seen = 1'b0;
+always_ff @(posedge clk_49m) begin
+	if (!reset)            ml0_seen <= 1'b0;
+	else if (mainlatch[0]) ml0_seen <= 1'b1;   // main has taken over NMI control
+end
+wire nmi_mask    = ml0_seen ? mainlatch[0]                   // game controls NMI after bootstrap
+                            : (mainlatch[0] | mainlatch[2]); // bootstrap: force on after sub-release
 wire flip_screen = 1'b0; // rot_flip ^ mainlatch[1];
 wire cpu2_rst    = ~mainlatch[2];
 
@@ -869,6 +874,9 @@ reg [19:0] diag_alive_cnt;
 reg io_wr_ever, ml1_ever, ml2_ever, cpu2_m1_ever, shared_wr_ever, gfxctrl_ever;
 reg [15:0] diag2_a_prev;
 reg [19:0] diag2_alive_cnt;
+// DIAG-REVERT-2026-05-29 (row 3, thin top strip): the SUB's HALF of the handshake +
+// whether the main ever self-enables NMI. These pin the attract-mode lock.
+reg sub_swr_ever, cpu2_iack_ever, ml0_ever;
 always_ff @(posedge clk_49m) begin
     if (!reset) begin
         cpu_m1_ever <= 1'b0; nmi_ever <= 1'b0; bg_wr_ever <= 1'b0;
@@ -877,6 +885,7 @@ always_ff @(posedge clk_49m) begin
         io_wr_ever <= 1'b0; ml1_ever <= 1'b0; ml2_ever <= 1'b0;
         cpu2_m1_ever <= 1'b0; shared_wr_ever <= 1'b0; gfxctrl_ever <= 1'b0;
         diag2_a_prev <= 16'd0; diag2_alive_cnt <= 20'd0;
+        sub_swr_ever <= 1'b0; cpu2_iack_ever <= 1'b0; ml0_ever <= 1'b0;
     end else begin
         if (~cpu1_M1_n & ~cpu1_MREQ_n)            cpu_m1_ever  <= 1'b1;
         if (cpu1_nmi)                             nmi_ever     <= 1'b1;
@@ -894,6 +903,10 @@ always_ff @(posedge clk_49m) begin
         if (~cpu2_M1_n & ~cpu2_MREQ_n) cpu2_m1_ever   <= 1'b1;  // sub fetched opcode
         if (cs_shared & ~cpu1_WR_n)    shared_wr_ever <= 1'b1;  // main wrote shared RAM
         if (cs_gfxctrl)                gfxctrl_ever   <= 1'b1;  // main wrote $B000 (late init)
+        // Row 3 — the SUB's half of the handshake + main's own NMI-enable
+        if (cs2_shared & ~cpu2_WR_n)   sub_swr_ever   <= 1'b1;  // SUB wrote shared RAM (its response)
+        if (~cpu2_IORQ_n & ~cpu2_M1_n) cpu2_iack_ever <= 1'b1;  // sub took an IRQ (int-ack)
+        if (mainlatch[0])              ml0_ever       <= 1'b1;  // main set NMI-enable ON ITS OWN
         diag2_a_prev <= cpu2_A;
         if (cpu2_A != diag2_a_prev)        diag2_alive_cnt <= 20'hFFFFF;
         else if (diag2_alive_cnt != 20'd0) diag2_alive_cnt <= diag2_alive_cnt - 20'd1;
@@ -958,15 +971,42 @@ wire [4:0] diag_r = diag_row1 ? cell_r : diag_row2 ? cell2_r : cpu1_A[15:11];  /
 wire [4:0] diag_g = diag_row1 ? cell_g : diag_row2 ? cell2_g : cpu1_A[10:6];
 wire [4:0] diag_b = diag_row1 ? cell_b : diag_row2 ? cell2_b : cpu1_A[5:1];
 
-// DIAG-REVERT-2026-05-29: original 4 assigns below, uncomment to restore
-// assign prom_addr = composite_pal;
-// assign red   = visible ? {prom_r_D[3:0], prom_r_D[3]} : 5'd0;
-// assign green = visible ? {prom_g_D[3:0], prom_g_D[3]} : 5'd0;
-// assign blue  = visible ? {prom_b_D[3:0], prom_b_D[3]} : 5'd0;
-assign prom_addr = diag_swatch ? diag_swatch_index : composite_pal;
-assign red   = !visible ? 5'd0 : diag_direct ? diag_r : {prom_r_D[3:0], prom_r_D[3]};
-assign green = !visible ? 5'd0 : diag_direct ? diag_g : {prom_g_D[3:0], prom_g_D[3]};
-assign blue  = !visible ? 5'd0 : diag_direct ? diag_b : {prom_b_D[3:0], prom_b_D[3]};
+// DIAG-REVERT-2026-05-29 (row 3): THIN TOP STRIP (v_cnt 16..23) overlaid on the REAL
+// game so we keep the picture. 4 cells (32px), colour if sticky-true else BLACK:
+//   0 GREEN cpu2_iack_ever — sub services IRQs (expected green; sound works)
+//   1 CYAN  sub_swr_ever   — sub WRITES shared RAM = completes its handshake half (KEY)
+//   2 BLUE  ml0_ever       — main set mainlatch[0] (NMI-enable) ON ITS OWN = handshake done
+//   7 WHITE calibration
+// READ: CYAN black -> sub never writes back -> handshake can't complete -> main locks at
+//   attract (fix the sub IRQ handler / handshake). CYAN green + BLUE black -> sub writes
+//   but main still won't self-enable NMI -> its wait is a specific value, not just "sub
+//   wrote". BLUE green -> handshake DID complete -> the attract lock is NOT the sub.
+reg [4:0] strip_r, strip_g, strip_b;
+always_comb begin
+    strip_r = 5'd0; strip_g = 5'd0; strip_b = 5'd0;
+    case (diag_cell)
+        3'd0: if (cpu2_iack_ever) strip_g = 5'd31;                            // GREEN
+        3'd1: if (sub_swr_ever)   begin strip_g = 5'd31; strip_b = 5'd31; end // CYAN
+        3'd2: if (ml0_ever)       strip_b = 5'd31;                            // BLUE
+        3'd7:                     begin strip_r = 5'd31; strip_g = 5'd31; strip_b = 5'd31; end // WHITE
+        default: ;
+    endcase
+end
+wire diag_strip = (v_cnt >= 9'd16) & (v_cnt < 9'd24) & (base_h_cnt < 9'd256);
+
+// DIAG-2026-05-29: full overlay OFF (game running); only the THIN ROW-3 STRIP (v_cnt
+// 16..23) is overlaid so we keep the picture AND read the sub-handshake. Restore the
+// pristine render = drop `diag_strip ? strip_* :` from the 3 lines below. Re-arm the FULL
+// overlay = use the 4 fully-commented lines at the very bottom instead.
+assign prom_addr = composite_pal;
+assign red   = !visible ? 5'd0 : diag_strip ? strip_r : {prom_r_D[3:0], prom_r_D[3]};
+assign green = !visible ? 5'd0 : diag_strip ? strip_g : {prom_g_D[3:0], prom_g_D[3]};
+assign blue  = !visible ? 5'd0 : diag_strip ? strip_b : {prom_b_D[3:0], prom_b_D[3]};
+// Full-overlay drive (DISABLED — swap with the 4 lines above to re-arm rows 1/2/PC/swatch):
+// assign prom_addr = diag_swatch ? diag_swatch_index : composite_pal;
+// assign red   = !visible ? 5'd0 : diag_direct ? diag_r : {prom_r_D[3:0], prom_r_D[3]};
+// assign green = !visible ? 5'd0 : diag_direct ? diag_g : {prom_g_D[3:0], prom_g_D[3]};
+// assign blue  = !visible ? 5'd0 : diag_direct ? diag_b : {prom_b_D[3:0], prom_b_D[3]};
 // DIAG-REVERT-2026-05-29: video-state diagnostic overlay   <<< END DIAGNOSTIC <<<
 //========================================================================
 
