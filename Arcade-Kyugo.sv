@@ -334,7 +334,7 @@ assign cfg_write = 0;
 assign cfg_address = 0;
 assign cfg_data = 0;
 
-wire reset = RESET | status[0] | buttons[1];
+wire reset = RESET | status[0] | buttons[1] | ioctl_download;
 
 ///////////////////         Keyboard           //////////////////
 
@@ -458,7 +458,7 @@ wire flip = ~no_rotate ^ status[11];
 wire video_rotated;
 screen_rotate screen_rotate(.*);
 
-arcade_video #(256, 24) arcade_video
+arcade_video #(288, 24) arcade_video
 (
 	.*,
 

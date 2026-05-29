@@ -45,7 +45,7 @@ module selector
 (
     input  logic [24:0] ioctl_addr,
     output logic        main_rom_cs,  // 0x00000-0x07FFF (32KB)
-    output logic        sub_rom_cs,   // 0x08000-0x0FFFF (32KB)
+    output logic        sub_rom_cs,   // 0x08000-0x0BFFF (16KB; MRA pads 0x0C000-0x0FFFF with zeros — MUST NOT be in this CS window or the pad wraps into eprom_16k and wipes the ROM)
     output logic        fg_rom_cs,    // 0x10000-0x10FFF (4KB)
     output logic        bg0_rom_cs,   // 0x11000-0x14FFF (16KB)
     output logic        bg1_rom_cs,   // 0x15000-0x18FFF (16KB)
@@ -65,7 +65,10 @@ module selector
          prom_r_cs, prom_g_cs, prom_b_cs, prom_lut_cs, prom_tim_cs} = 14'd0;
 
         if      (ioctl_addr < 25'h08000) main_rom_cs = 1;
-        else if (ioctl_addr < 25'h10000) sub_rom_cs  = 1;
+        else if (ioctl_addr < 25'h0C000) sub_rom_cs  = 1;
+        // 0x0C000-0x0FFFF is the 8KB zero-pad after sub_rom — falls through to fg_rom_cs.
+        // fg_rom is eprom_4k so the pad just wraps + gets overwritten by the real ROM bytes
+        // at 0x10000-0x10FFF. Harmless. The key is that the pad is NOT in sub_rom_cs.
         else if (ioctl_addr < 25'h11000) fg_rom_cs   = 1;
         else if (ioctl_addr < 25'h15000) bg0_rom_cs  = 1;
         else if (ioctl_addr < 25'h19000) bg1_rom_cs  = 1;

@@ -44,7 +44,11 @@ module Kyugo_CPU
 
 //------------------------------------------------------- Clock enables -------------------------------------------------------//
 
-// Pixel clock: 49.152 MHz * 4/32 = 6.144 MHz = XTAL/3 (matches MAME set_raw(XTAL/3, 396, 0, 288, 260, 16, 240) → 59.6575 Hz)
+// Pixel clock: 49.152 MHz * 4/32 = 6.144 MHz = XTAL/3 (matches MAME set_raw(XTAL/3, 396, 0, 288, 260, 16, 240) → 59.6575 Hz).
+// Restored 2026-05-16: a previous edit replaced this with a manual 5-bit counter using
+// `cen_pix = (pix_div[4:2] == 3'd0)` — that's a 4-cycle-wide LEVEL, not a 1-cycle pulse,
+// so every `if (cen_pix)` block fired 4× per intended pixel. jtframe_frac_cen produces
+// the correct single-cycle pulse every 8 clk_49m cycles.
 wire [1:0] pix_cen_o;
 jtframe_frac_cen #(2) pix_cen (.clk(clk_49m), .n(10'd4), .m(10'd32), .cen(pix_cen_o), .cenb());
 wire cen_pix = pix_cen_o[0];
@@ -65,6 +69,8 @@ reg [8:0] v_cnt      = 9'd0;
 
 wire [8:0] h_cnt_rot;
 wire [8:0] v_cnt_rot;
+wire [8:0] h_cnt_sync = base_h_cnt;
+wire [8:0] v_cnt_sync = v_cnt;
 
 assign h_cnt_rot = { base_h_cnt[8], base_h_cnt[7:0] ^ {8{flip_screen}} };
 assign v_cnt_rot = { v_cnt[8],      v_cnt[7:0]      ^ {8{flip_screen}} };
@@ -85,12 +91,20 @@ wire vblk = (v_cnt < 9'd16) | (v_cnt >= 9'd240);
 assign video_hblank = hblk;
 assign video_vblank = vblk;
 
-wire [8:0] hs_start = 9'd300 + {5'd0, h_center};
+//wire [8:0] hs_start = 9'd300 + {5'd0, h_center};
+//wire [8:0] hs_end   = hs_start + 9'd16;
+//wire [8:0] vs_start = 9'd244 + {5'd0, v_center};
+//wire [8:0] vs_end   = vs_start + 9'd4;
+//assign video_hsync = (h_cnt_rot >= hs_start && h_cnt_rot < hs_end);
+//assign video_vsync = (v_cnt_rot >= vs_start && v_cnt_rot < vs_end);
+//assign video_csync = ~(video_hsync ^ video_vsync);
+
+wire [8:0] hs_start = 9'd292 + {5'd0, h_center};  // Try moving earlier into blanking (was 300)
 wire [8:0] hs_end   = hs_start + 9'd16;
-wire [8:0] vs_start = 9'd244 + {5'd0, v_center};
+wire [8:0] vs_start = 9'd242 + {5'd0, v_center};  // Slight adjustment
 wire [8:0] vs_end   = vs_start + 9'd4;
-assign video_hsync = (h_cnt_rot >= hs_start && h_cnt_rot < hs_end);
-assign video_vsync = (v_cnt_rot >= vs_start && v_cnt_rot < vs_end);
+assign video_hsync = (h_cnt_sync >= hs_start && h_cnt_sync < hs_end);
+assign video_vsync = (v_cnt_sync >= vs_start && v_cnt_sync < vs_end);
 assign video_csync = ~(video_hsync ^ video_vsync);
 
 //------------------------------------------------------- CPU1 — Main ---------------------------------------------------------//
@@ -151,7 +165,7 @@ always_ff @(posedge clk_49m) begin
 	else if (cen_cpu && cs_mainlatch) mainlatch[cpu1_A[2:0]] <= cpu1_Dout[0];
 end
 wire nmi_mask    = mainlatch[0];
-wire flip_screen = rot_flip ^ mainlatch[1];
+wire flip_screen = 1'b0; // rot_flip ^ mainlatch[1];
 wire cpu2_rst    = ~mainlatch[2];
 
 //------------------------------------------------------- CPU2 — Sub ----------------------------------------------------------//
@@ -408,20 +422,20 @@ eprom_4k fgtile_rom (.CLK(clk_49m), .ADDR(fgtile_addr), .CLK_DL(clk_49m),
 reg [13:0] bg0_addr, bg1_addr, bg2_addr;
 wire [7:0] bg0_D, bg1_D, bg2_D;
 eprom_16k bg0_rom (.CLK(clk_49m), .ADDR(bg0_addr), .CLK_DL(clk_49m),
-	.ADDR_DL(ioctl_addr), .DATA_IN(ioctl_data), .CS_DL(bg0_rom_cs_i), .WR(ioctl_wr), .DATA(bg0_D));
+    .ADDR_DL(ioctl_addr - 25'h11000), .DATA_IN(ioctl_data), .CS_DL(bg0_rom_cs_i), .WR(ioctl_wr), .DATA(bg0_D));
 eprom_16k bg1_rom (.CLK(clk_49m), .ADDR(bg1_addr), .CLK_DL(clk_49m),
-	.ADDR_DL(ioctl_addr), .DATA_IN(ioctl_data), .CS_DL(bg1_rom_cs_i), .WR(ioctl_wr), .DATA(bg1_D));
+    .ADDR_DL(ioctl_addr - 25'h15000), .DATA_IN(ioctl_data), .CS_DL(bg1_rom_cs_i), .WR(ioctl_wr), .DATA(bg1_D));
 eprom_16k bg2_rom (.CLK(clk_49m), .ADDR(bg2_addr), .CLK_DL(clk_49m),
-	.ADDR_DL(ioctl_addr), .DATA_IN(ioctl_data), .CS_DL(bg2_rom_cs_i), .WR(ioctl_wr), .DATA(bg2_D));
+    .ADDR_DL(ioctl_addr - 25'h19000), .DATA_IN(ioctl_data), .CS_DL(bg2_rom_cs_i), .WR(ioctl_wr), .DATA(bg2_D));
 
 reg [14:0] spr_addr;
 wire [7:0] spr0_D, spr1_D, spr2_D;
 eprom_32k spr0_rom (.CLK(clk_49m), .ADDR(spr_addr), .CLK_DL(clk_49m),
-	.ADDR_DL(ioctl_addr), .DATA_IN(ioctl_data), .CS_DL(spr0_rom_cs_i), .WR(ioctl_wr), .DATA(spr0_D));
+    .ADDR_DL(ioctl_addr - 25'h1D000), .DATA_IN(ioctl_data), .CS_DL(spr0_rom_cs_i), .WR(ioctl_wr), .DATA(spr0_D));
 eprom_32k spr1_rom (.CLK(clk_49m), .ADDR(spr_addr), .CLK_DL(clk_49m),
-	.ADDR_DL(ioctl_addr), .DATA_IN(ioctl_data), .CS_DL(spr1_rom_cs_i), .WR(ioctl_wr), .DATA(spr1_D));
+    .ADDR_DL(ioctl_addr - 25'h25000), .DATA_IN(ioctl_data), .CS_DL(spr1_rom_cs_i), .WR(ioctl_wr), .DATA(spr1_D));
 eprom_32k spr2_rom (.CLK(clk_49m), .ADDR(spr_addr), .CLK_DL(clk_49m),
-	.ADDR_DL(ioctl_addr), .DATA_IN(ioctl_data), .CS_DL(spr2_rom_cs_i), .WR(ioctl_wr), .DATA(spr2_D));
+    .ADDR_DL(ioctl_addr - 25'h2D000), .DATA_IN(ioctl_data), .CS_DL(spr2_rom_cs_i), .WR(ioctl_wr), .DATA(spr2_D));
 
 wire [7:0] prom_addr;
 reg  [4:0] prom_lut_addr;
