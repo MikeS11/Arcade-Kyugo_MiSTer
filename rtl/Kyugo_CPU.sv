@@ -210,15 +210,21 @@ end
 //       the main DOES set mainlatch[0] itself (ml0 cell black->blue) and the sub DOES
 //       write shared RAM. So once the main has taken NMI control (ml0_seen), follow the
 //       REAL mainlatch[0] — letting the game disable NMI when it needs to.
-// Revert = restore `wire nmi_mask = mainlatch[0];` and delete the ml0_seen latch.
-// wire nmi_mask = mainlatch[0];
-reg ml0_seen = 1'b0;
+// DIAG-REVERT-2026-05-29 (NMI BOOTSTRAP REMOVED): v3 force-enabled NMI after sub-release until
+// the main set mainlatch[0] — a band-aid for the "boot deadlock," which we now believe WAS the
+// missed-NMI bug (narrow pulse dropped on CEN), now fixed in the cpu1_nmi block. With reliable
+// NMI, the forced bootstrap pulse instead slams into early init at a phase-dependent point →
+// FLAKY STARTUP (runtime is already stable). Reverted to the real nmi_mask = mainlatch[0] so the
+// game enables its own vblank NMI when ready. If this re-introduces a boot deadlock, the
+// bootstrap was needed for a separate reason → restore the v3 line + use of ml0_seen below.
+reg ml0_seen = 1'b0;   // kept (unused now) for easy restore of the v3 bootstrap
 always_ff @(posedge clk_49m) begin
-	if (!reset_cpu)        ml0_seen <= 1'b0;  // reset_cpu: +watchdog (re-arm NMI bootstrap on reboot)
-	else if (mainlatch[0]) ml0_seen <= 1'b1;   // main has taken over NMI control
+	if (!reset_cpu)        ml0_seen <= 1'b0;
+	else if (mainlatch[0]) ml0_seen <= 1'b1;
 end
-wire nmi_mask    = ml0_seen ? mainlatch[0]                   // game controls NMI after bootstrap
-                            : (mainlatch[0] | mainlatch[2]); // bootstrap: force on after sub-release
+wire nmi_mask = mainlatch[0];   // REAL: the game controls its own vblank-NMI enable
+// v3 bootstrap (removed — restore if boot deadlocks):
+// wire nmi_mask = ml0_seen ? mainlatch[0] : (mainlatch[0] | mainlatch[2]);
 wire flip_screen = 1'b0; // rot_flip ^ mainlatch[1];
 wire cpu2_rst    = ~mainlatch[2];
 
