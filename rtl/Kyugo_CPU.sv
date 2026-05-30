@@ -372,7 +372,10 @@ eprom_32k main_rom (.CLK(clk_49m), .ADDR(cpu1_A[14:0]), .CLK_DL(clk_49m),
 	.ADDR_DL(ioctl_addr), .DATA_IN(ioctl_data), .CS_DL(main_rom_cs_i), .WR(ioctl_wr), .DATA(main_rom_D));
 
 wire [7:0] sub_rom_D;
-eprom_16k sub_rom (.CLK(clk_49m), .ADDR(cpu2_A[13:0]), .CLK_DL(clk_49m),
+// DIAG-REVERT-2026-05-29 (sub_rom 16K→32K): sister games (Repulse/Flashgal/SonOfPhoenix) have
+// 32KB sub ROMs; eprom_16k truncated them. Gyrodine (8KB sub) uses only the low 8KB → unaffected.
+// Original: eprom_16k sub_rom (.ADDR(cpu2_A[13:0]) ...)
+eprom_32k sub_rom (.CLK(clk_49m), .ADDR(cpu2_A[14:0]), .CLK_DL(clk_49m),
 	.ADDR_DL(ioctl_addr), .DATA_IN(ioctl_data), .CS_DL(sub_rom_cs_i), .WR(ioctl_wr), .DATA(sub_rom_D));
 
 //------------------------------------------------------- VRAM (Kyugo map) ---------------------------------------------------//

@@ -354,7 +354,10 @@ always_ff @(posedge CLK_49M) begin
         asr_cnt <= 28'd0; asr_pulse <= 1'b0; asr_done <= 1'b0;
     end else if (reset_base) begin
         asr_cnt <= 28'd0;                         // hold off while any base reset is active
-    end else if (!asr_done) begin
+    // DIAG-2026-05-29: auto-second-reset is a GYRODINE-ONLY cold-boot hack — gate to variant 0.
+    // The sisters load full 32K subs and don't need it; the unconditional ~4s kick was halting
+    // them ("00" after the kick). Was: `end else if (!asr_done)`.
+    end else if (!asr_done && core_config[2:0] == 3'd0) begin
         asr_cnt <= asr_cnt + 28'd1;
         if (asr_cnt == ASR_AT)                  asr_pulse <= 1'b1;                          // fire auto soft-reset
         if (asr_cnt == ASR_AT + 28'd500_000) begin asr_pulse <= 1'b0; asr_done <= 1'b1; end // ~10ms pulse, then one-shot done
@@ -456,7 +459,7 @@ always_ff @(posedge CLK_49M) begin
         core_config <= ioctl_dout;
 end
 
-wire rot_flip = core_config[0];
+wire rot_flip = core_config[3];  // DIAG-2026-05-29: was [0] (collided with variant_sel[0]); decoupled to bit 3
 
 ///////////////                 Video                  ////////////////
 
@@ -483,7 +486,11 @@ wire [7:0] b = (b_out[0] ? 8'h19 : 8'h00) +
 wire ce_pix;
 
 wire rotate_ccw = rot_flip ? 0 : 1;
-wire no_rotate = status[12] | direct_video;
+// DIAG-2026-05-29: rot_flip was core_config[0], which COLLIDED with variant_sel[0] (Kyugo.sv:84)
+// → rotation = variant&1 (Repulse/SRD flipped vs Gyrodine). Decoupled to bit 3 (variant_sel still
+// uses [2:0]). All ROT90 sets (Gyro/Repulse/SRD) now share rot_flip=0 → rotate the same way.
+// no_rotate bit 4 = per-game "horizontal" (ROT0 sets Flashgal/Legend) so they aren't rotated.
+wire no_rotate = status[12] | direct_video | core_config[4];
 wire flip = ~no_rotate ^ status[11];
 wire video_rotated;
 screen_rotate screen_rotate(.*);

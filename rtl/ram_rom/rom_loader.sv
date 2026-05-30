@@ -65,10 +65,12 @@ module selector
          prom_r_cs, prom_g_cs, prom_b_cs, prom_lut_cs, prom_tim_cs} = 14'd0;
 
         if      (ioctl_addr < 25'h08000) main_rom_cs = 1;
-        else if (ioctl_addr < 25'h0C000) sub_rom_cs  = 1;
-        // 0x0C000-0x0FFFF is the 8KB zero-pad after sub_rom — falls through to fg_rom_cs.
-        // fg_rom is eprom_4k so the pad just wraps + gets overwritten by the real ROM bytes
-        // at 0x10000-0x10FFF. Harmless. The key is that the pad is NOT in sub_rom_cs.
+        // DIAG-REVERT-2026-05-29 (sub_rom 16K→32K): sub_rom is now eprom_32k, so extend the CS to
+        // the full 0x08000-0x0FFFF (32KB) region. Was `< 0x0C000` (16KB) to avoid the Gyrodine
+        // sub zero-pad wrapping into the 16KB eprom and wiping the ROM — no wrap now (BRAM is 32KB),
+        // and the pad lands in sub_rom's unused upper 16KB. Original: else if (ioctl_addr < 25'h0C000).
+        else if (ioctl_addr < 25'h10000) sub_rom_cs  = 1;
+        // FG now starts cleanly at 0x10000 (the sub pad no longer falls through to fg_rom_cs).
         else if (ioctl_addr < 25'h11000) fg_rom_cs   = 1;
         else if (ioctl_addr < 25'h15000) bg0_rom_cs  = 1;
         else if (ioctl_addr < 25'h19000) bg1_rom_cs  = 1;
