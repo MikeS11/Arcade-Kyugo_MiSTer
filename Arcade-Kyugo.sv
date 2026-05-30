@@ -344,7 +344,36 @@ assign cfg_data = 0;
 //      a good one. RAM is preserved (no re-download) = exactly the manual soft reset. Armed once
 //      per power-on (RESET). TUNE ASR_AT: must be > time-to-reach-SUB-CHECK; lower for faster boot.
 //      Revert = `wire reset = reset_base;` and delete the FSM.
-wire reset_base = RESET | status[0] | buttons[1] | ioctl_download | ~locked;
+wire base_cond = RESET | status[0] | buttons[1] | ioctl_download | ~locked;
+
+// DIAG-REVERT-2026-05-30 (SETTLE-HOLD experiment — the user's "force a wait until ready" idea):
+//   USE_SETTLE_HOLD=1 -> hold ALL CPUs in reset for SETTLE_CYCLES after base_cond clears, then
+//   release ONCE (no retry). This isolates WHY the ASR works: if the cold-boot SUB CHECK is pure
+//   readiness/timing, Gyrodine boots CLEAN (no visible reset flash). If it still hangs even with a
+//   generous hold, the *restart* (not the wait) is what fixes it -> the BRAM is fine and the failed
+//   first attempt corrupts state that only a reset clears. NOTE: FPGA BRAM does NOT "settle" — once
+//   ioctl_download writes it (reset held through download) it reads correct on the next clock — so my
+//   bet is the restart matters; this is the clean way to find out.
+//   USE_SETTLE_HOLD=0 -> EXACTLY the original auto-second-reset RETRY (known-good for Gyrodine).
+//   If the hold works, tune SETTLE_CYCLES DOWN to the smallest that still boots = the real settle time.
+localparam        USE_SETTLE_HOLD = 1'b0;   // EXPERIMENT DONE 2026-05-30: a 4s hold still hung Gyrodine
+                                             // (SUB CHECK FFFF) -> NOT timing; the ASR *restart* is what
+                                             // fixes it (RAM preserved across reset). Reverted to ASR.
+localparam [27:0] SETTLE_CYCLES   = 28'd200_000_000;   // ~4.07 s @ 49.152 MHz (decisive first test; tune down)
+reg  [27:0] settle_cnt  = 28'd0;
+reg         settle_done = 1'b0;
+always_ff @(posedge CLK_49M) begin
+    if (base_cond)         begin settle_cnt <= 28'd0; settle_done <= 1'b0; end  // re-arm on any base reset
+    else if (!settle_done) begin
+        settle_cnt <= settle_cnt + 28'd1;
+        if (settle_cnt == SETTLE_CYCLES) settle_done <= 1'b1;                   // release once
+    end
+end
+wire settle_hold = USE_SETTLE_HOLD & ~base_cond & ~settle_done;
+wire reset_base  = base_cond | settle_hold;            // CPUs held through the settle window
+
+// Original AUTO SECOND-RESET retry (see 337-346). Auto-disabled while the settle-hold runs so the
+// two can't fight; flip USE_SETTLE_HOLD=0 to restore it byte-for-byte.
 localparam [27:0] ASR_AT = 28'd200_000_000;     // ~4.07 s @ 49.152 MHz (after SUB CHECK has failed)
 reg  [27:0] asr_cnt   = 28'd0;
 reg         asr_pulse = 1'b0;
@@ -354,10 +383,9 @@ always_ff @(posedge CLK_49M) begin
         asr_cnt <= 28'd0; asr_pulse <= 1'b0; asr_done <= 1'b0;
     end else if (reset_base) begin
         asr_cnt <= 28'd0;                         // hold off while any base reset is active
-    // DIAG-2026-05-29: auto-second-reset is a GYRODINE-ONLY cold-boot hack — gate to variant 0.
-    // The sisters load full 32K subs and don't need it; the unconditional ~4s kick was halting
-    // them ("00" after the kick). Was: `end else if (!asr_done)`.
-    end else if (!asr_done && core_config[2:0] == 3'd0) begin
+    // DIAG-2026-05-29: ASR is a GYRODINE-ONLY cold-boot hack — variant 0 only; also OFF when the
+    // settle-hold experiment is active so they don't fight. Was: `end else if (!asr_done)`.
+    end else if (!asr_done && core_config[2:0] == 3'd0 && !USE_SETTLE_HOLD) begin
         asr_cnt <= asr_cnt + 28'd1;
         if (asr_cnt == ASR_AT)                  asr_pulse <= 1'b1;                          // fire auto soft-reset
         if (asr_cnt == ASR_AT + 28'd500_000) begin asr_pulse <= 1'b0; asr_done <= 1'b1; end // ~10ms pulse, then one-shot done
