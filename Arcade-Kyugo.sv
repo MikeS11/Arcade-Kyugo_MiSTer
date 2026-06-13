@@ -385,7 +385,10 @@ always_ff @(posedge CLK_49M) begin
         asr_cnt <= 28'd0;                         // hold off while any base reset is active
     // DIAG-2026-05-29: ASR is a GYRODINE-ONLY cold-boot hack — variant 0 only; also OFF when the
     // settle-hold experiment is active so they don't fight. Was: `end else if (!asr_done)`.
-    end else if (!asr_done && core_config[2:0] == 3'd0 && !USE_SETTLE_HOLD) begin
+    // ASR-UNIVERSAL-2026-06-12: was gated to Gyrodine (variant 0) because "sisters halted on 00 after
+    // the kick" — that "00" was the DSW-Freeze bug, now FIXED. Cold-boot SUB CHECK is universal, so kick
+    // ALL variants. Gyrodine-only was: end else if (!asr_done && core_config[2:0] == 3'd0 && !USE_SETTLE_HOLD)
+    end else if (!asr_done && !USE_SETTLE_HOLD) begin
         asr_cnt <= asr_cnt + 28'd1;
         if (asr_cnt == ASR_AT)                  asr_pulse <= 1'b1;                          // fire auto soft-reset
         if (asr_cnt == ASR_AT + 28'd500_000) begin asr_pulse <= 1'b0; asr_done <= 1'b1; end // ~10ms pulse, then one-shot done
@@ -474,7 +477,7 @@ pause #(8,8,8,49) pause
 );
 
 // DIP SWITCHES
-reg [7:0] dip_sw[8];	// Active-LOW
+reg [7:0] dip_sw[8] = '{8'hFF,8'hFF,8'hFF,8'hFF,8'hFF,8'hFF,8'hFF,8'hFF};	// FF fallback = no-freeze if MRA <dip> ever fails to download; real per-game defaults come from the MRA
 always @(posedge CLK_49M) begin
 	if(ioctl_wr && (ioctl_index==254) && !ioctl_addr[24:3])
 		dip_sw[ioctl_addr[2:0]] <= ioctl_dout;

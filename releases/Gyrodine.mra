@@ -27,16 +27,16 @@
 	<num_buttons>2</num_buttons>
 	<button_names>Fire,Bomb</button_names>
 
-	<switches default="FF,FF">
-		<!-- DSW1 (AY1 port A) -->
-		<dip bits="0,1"   name="Lives"      ids="6,5,4,3"/>
-		<dip bits="4"     name="Difficulty" ids="Hard,Easy"/>
-		<dip bits="5"     name="Bonus Life" ids="40k/70k,20k/50k"/>
-		<dip bits="6"     name="Cabinet"    ids="Upright,Cocktail"/>
-		<dip bits="7"     name="Freeze"     ids="On,Off"/>
+	<switches default="BF,FF">
+		<!-- DSW1 (AY1 port A, read & inverted by sub) -->
+		<dip bits="0,1"      name="Lives"       ids="6,5,4,3"/>
+		<dip bits="4"        name="Difficulty"  ids="Hard,Easy"/>
+		<dip bits="5"        name="Bonus Life"  ids="40k/70k,20k/50k"/>
+		<dip bits="6"        name="Cabinet"     ids="Upright,Cocktail"/>
+		<dip bits="7"        name="Freeze"      ids="On,Off"/>
 		<!-- DSW2 (AY1 port B) -->
-		<dip bits="8,10"  name="Coin A"     ids="Free Play,3C/2C,2C/1C,1C/6C,1C/4C,1C/3C,1C/2C,1C/1C"/>
-		<dip bits="11,13" name="Coin B"     ids="5C/1C,4C/1C,3C/1C,2C/1C,3C/4C,1C/3C,1C/2C,1C/1C"/>
+		<dip bits="8,9,10"   name="Coin A"      ids="Free Play,3C/2C,2C/1C,1C/6C,1C/4C,1C/3C,1C/2C,1C/1C"/>
+		<dip bits="11,12,13" name="Coin B"      ids="5C/1C,4C/1C,3C/1C,2C/1C,3C/4C,1C/3C,1C/2C,1C/1C"/>
 	</switches>
 
 	<!-- Index 1: variant selector (0 = Gyrodine) -->

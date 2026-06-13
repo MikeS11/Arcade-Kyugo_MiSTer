@@ -17,13 +17,26 @@
 	<num_buttons>2</num_buttons>
 	<button_names>Fire,Bomb</button_names>
 
-	<switches default="FF,FF">
-		<!-- placeholder defaults; refine DSW labels later -->
+	<switches default="AF,FF">
+		<!-- DSW1 (AY1 port A, read & inverted by sub) -->
+		<dip bits="0,1"      name="Lives"          ids="6,5,4,3"/>
+		<dip bits="2"        name="Bonus Life"     ids="Every 70000,Every 50000"/>
+		<dip bits="3"        name="Slow Motion"    ids="On,Off"/>
+		<dip bits="4"        name="Allow Continue" ids="Yes,No"/>
+		<dip bits="5"        name="Sound Test"     ids="On,Off"/>
+		<dip bits="6"        name="Cabinet"        ids="Upright,Cocktail"/>
+		<dip bits="7"        name="Freeze"         ids="On,Off"/>
+		<!-- DSW2 (AY1 port B) -->
+		<dip bits="8,9,10"   name="Coin A"         ids="Free Play,3C/2C,2C/1C,1C/6C,1C/4C,1C/3C,1C/2C,1C/1C"/>
+		<dip bits="11,12,13" name="Coin B"         ids="5C/1C,4C/1C,3C/1C,2C/1C,3C/4C,1C/3C,1C/2C,1C/1C"/>
 	</switches>
 
-	<!-- Index 1: byte = variant(2) | no_rotate(bit4) — Flashgal is ROT0/horizontal → 0x12 -->
+	<!-- Index 1: variant_sel[2:0] | rot_flip[3] | no_rotate[4]. FIX 2026-06-12: the Flashgal (Sega) ROMs run
+	     the REPULSE hardware map (sub shared @ A000, AY1 @ port 00, inputs C000/C040/C080) per MAME
+	     GAME(flashgal,...,repulse,...). So variant = 1 (REPULSE), NOT 2 (flashgala = E000/AY40). Keep
+	     no_rotate (ROT0). 0x12 (var 2) made the sub's $FF->A004 land nowhere => SUB CHECK lock. -> 0x11 -->
 	<rom index="1">
-		<part>12</part>
+		<part>11</part>
 	</rom>
 
 	<!-- Index 0: ROM blob in loader order (needs the sub_rom-widened core: sub region is 32KB) -->

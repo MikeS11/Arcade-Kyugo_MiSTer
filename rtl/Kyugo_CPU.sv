@@ -425,9 +425,15 @@ wire [7:0] shared_ram_D_cpu1, shared_ram_D_cpu2;
 wire       cs_shared_main = cs_shared | cs_shared_e;
 dpram_dc #(.widthad_a(11)) shared_ram (
 	.clock_a(clk_49m),
-	.address_a(hs_write ? hs_address[10:0] : cpu1_A[10:0]),
-	.data_a(hs_write ? hs_data_in : cpu1_Dout),
-	.wren_a((cs_shared_main & ~cpu1_WR_n) | hs_write),
+	// REMOVE-HISCORE-2026-06-12: hiscore was wired ONLY into this shared RAM (the main<->sub
+	// handshake region). hs_write was already 1'b0, but strip the mux entirely so it can never
+	// touch the handshake. Re-add later targeting the real hiscore RAM. Originals:
+	// .address_a(hs_write ? hs_address[10:0] : cpu1_A[10:0]),
+	// .data_a(hs_write ? hs_data_in : cpu1_Dout),
+	// .wren_a((cs_shared_main & ~cpu1_WR_n) | hs_write),
+	.address_a(cpu1_A[10:0]),
+	.data_a(cpu1_Dout),
+	.wren_a(cs_shared_main & ~cpu1_WR_n),
 	.q_a(shared_ram_D_cpu1),
 	.clock_b(clk_49m), .address_b(cpu2_A[10:0]), .data_b(cpu2_Dout),
 	.wren_b(cs2_shared & ~cpu2_WR_n), .q_b(shared_ram_D_cpu2));
@@ -1171,14 +1177,23 @@ wire [4:0] lp_b = diag_lp_cells ? lpc_b : cpu1_A[5:1];
 reg [10:0] hs_poll_addr; reg [7:0] hs_poll_val;
 reg [10:0] hs_subw_addr; reg [7:0] hs_subw_val;
 reg [15:0] hs_spin_pc;
+reg hs_cpu2_m1_ever = 1'b0;   // sub fetched any opcode
+reg hs_ml2_ever     = 1'b0;   // mainlatch[2] set = sub released from reset
 always_ff @(posedge clk_49m) begin
     if (!reset) begin
         hs_poll_addr<=11'd0; hs_poll_val<=8'd0;
         hs_subw_addr<=11'd0; hs_subw_val<=8'd0; hs_spin_pc<=16'd0;
+        hs_cpu2_m1_ever<=1'b0; hs_ml2_ever<=1'b0;
     end else begin
         if (cs_shared  & ~cpu1_RD_n)   begin hs_poll_addr <= cpu1_A[10:0]; hs_poll_val <= shared_ram_D_cpu1; end
-        if (cs2_shared & ~cpu2_WR_n)   begin hs_subw_addr <= cpu2_A[10:0]; hs_subw_val <= cpu2_Dout;        end
+        // DIAG-2026-06-12: latch ONLY the sub's write to offset 004 (the handshake token), held sticky,
+        // so MAGENTA subw_val shows if the sub committed $FF there. subw_val=FF + CYAN poll_val=00
+        // => write committed on port B but invisible on port A's read = cross-port (read-side) bug.
+        // Original (last-any-write): if (cs2_shared & ~cpu2_WR_n) begin hs_subw_addr <= cpu2_A[10:0]; hs_subw_val <= cpu2_Dout; end
+        if (cs2_shared & ~cpu2_WR_n & (cpu2_A[10:0]==11'h004)) begin hs_subw_addr <= cpu2_A[10:0]; hs_subw_val <= cpu2_Dout; end
         if (~cpu1_M1_n & ~cpu1_MREQ_n) hs_spin_pc <= cpu1_A;
+        if (~cpu2_M1_n & ~cpu2_MREQ_n) hs_cpu2_m1_ever <= 1'b1;
+        if (mainlatch[2])               hs_ml2_ever     <= 1'b1;
     end
 end
 wire [3:0]  hs_cell    = base_h_cnt[7:4];
@@ -1203,7 +1218,8 @@ always_comb begin
     if (hs_row_pval  & hs_v_pval[hs_bitsel])  begin hs_g=5'd31; hs_b=5'd31; end              // CYAN
     if (hs_row_saddr & hs_v_saddr[hs_bitsel]) begin hs_r=5'd31; hs_g=5'd31; end              // YELLOW
     if (hs_row_sval  & hs_v_sval[hs_bitsel])  begin hs_r=5'd31; hs_b=5'd31; end              // MAGENTA
-    if (hs_row_pc    & hs_v_pc[hs_bitsel])    begin hs_r=5'd31; hs_g=5'd16; end              // ORANGE
+    if (hs_row_pc    & hs_ml2_ever)                                   begin hs_r=5'd31; hs_g=5'd16; end              // ORANGE left half  = mainlatch[2] ever set (sub released)
+    if (hs_row_pc    & hs_cpu2_m1_ever & (base_h_cnt >= 9'd128))    begin hs_r=5'd31; hs_b=5'd31; end              // MAGENTA right half = sub CPU fetched opcode
 end
 
 // DIAG-2026-05-29: full overlay OFF (game running); only the THIN ROW-3 STRIP (v_cnt
@@ -1218,14 +1234,15 @@ end
 //   (3) STRIP (old committed): sub-handshake strip on the live game.
 assign prom_addr = composite_pal;
 // (1) PRISTINE — ACTIVE (clean video for the phase-fix boot→attract test):
+// (1) PRISTINE — ACTIVE (overlay OFF for screenshots; re-arm a probe below to debug):
 assign red   = !visible ? 5'd0 : {prom_r_D[3:0], prom_r_D[3]};
 assign green = !visible ? 5'd0 : {prom_g_D[3:0], prom_g_D[3]};
 assign blue  = !visible ? 5'd0 : {prom_b_D[3:0], prom_b_D[3]};
-// (2) LOCK PROBE — swap in to re-arm:
+// (2) LOCK PROBE:
 // assign red   = !visible ? 5'd0 : diag_lp ? lp_r : {prom_r_D[3:0], prom_r_D[3]};
 // assign green = !visible ? 5'd0 : diag_lp ? lp_g : {prom_g_D[3:0], prom_g_D[3]};
 // assign blue  = !visible ? 5'd0 : diag_lp ? lp_b : {prom_b_D[3:0], prom_b_D[3]};
-// (4) HANDSHAKE PROBE — swap in to re-arm (binary rows of the main<->sub handshake):
+// (4) HANDSHAKE PROBE (OFF — uncomment this triplet + comment PRISTINE to re-arm):
 // assign red   = !visible ? 5'd0 : hs_active ? hs_r : {prom_r_D[3:0], prom_r_D[3]};
 // assign green = !visible ? 5'd0 : hs_active ? hs_g : {prom_g_D[3:0], prom_g_D[3]};
 // assign blue  = !visible ? 5'd0 : hs_active ? hs_b : {prom_b_D[3:0], prom_b_D[3]};

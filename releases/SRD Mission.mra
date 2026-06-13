@@ -17,8 +17,18 @@
 	<num_buttons>2</num_buttons>
 	<button_names>Fire,Bomb</button_names>
 
-	<switches default="FF,FF">
-		<!-- placeholder defaults; refine DSW labels later -->
+	<switches default="BF,FF">
+		<!-- DSW1 (AY1 port A, read & inverted by sub) -->
+		<dip bits="0,1"      name="Lives"           ids="6,5,4,3"/>
+		<dip bits="2"        name="Bonus/Continue"  ids="70k/Yes,50k/No"/>
+		<dip bits="3"        name="Slow Motion"     ids="On,Off"/>
+		<dip bits="4"        name="Invulnerability" ids="On,Off"/>
+		<dip bits="5"        name="Sound Test"      ids="On,Off"/>
+		<dip bits="6"        name="Cabinet"         ids="Upright,Cocktail"/>
+		<dip bits="7"        name="Freeze"          ids="On,Off"/>
+		<!-- DSW2 (AY1 port B) -->
+		<dip bits="8,9,10"   name="Coin A"          ids="Free Play,3C/2C,2C/1C,1C/6C,1C/4C,1C/3C,1C/2C,1C/1C"/>
+		<dip bits="11,12,13" name="Coin B"          ids="5C/1C,4C/1C,3C/1C,2C/1C,3C/4C,1C/3C,1C/2C,1C/1C"/>
 	</switches>
 
 	<!-- Index 1: byte = variant(3) | rot_flip(bit3) — SRD renders 180° vs Gyrodine (internal
