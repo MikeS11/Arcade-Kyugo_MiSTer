@@ -604,11 +604,15 @@ always_ff @(posedge clk_49m) begin
             3'd1: begin
                 bg_code_nxt      <= {bgattr_rD[1:0], bgvram_rD};
                 bg_color_nxt     <= {bgpalbank, bgattr_rD[7:4]};
-                bg_fx_invert_nxt <= bgattr_rD[3] ^ flip_screen;            // per-tile flipx XOR screen flip
-                bg_fy_eff        <= bg_fy ^ {3{bgattr_rD[2] ^ flip_screen}}; // flipy XOR screen flip
-                bg0_addr <= {1'b0, {bgattr_rD[1:0], bgvram_rD}, (bg_fy ^ {3{bgattr_rD[2] ^ flip_screen}})};
-                bg1_addr <= {1'b0, {bgattr_rD[1:0], bgvram_rD}, (bg_fy ^ {3{bgattr_rD[2] ^ flip_screen}})};
-                bg2_addr <= {1'b0, {bgattr_rD[1:0], bgvram_rD}, (bg_fy ^ {3{bgattr_rD[2] ^ flip_screen}})};
+                // BG-FLIP-SWAP-FIX-2026-06-12: MAME get_bg_tile_info uses TILE_FLIPYX((attr&0x0c)>>2) ⇒
+                // flipX = attr BIT 2, flipY = attr BIT 3. We had them swapped (bit3/bit2 = the SPRITE
+                // convention), mirroring BG tiles on the wrong axis. (FG has no per-tile flip — correct.)
+                // Was: flipx=bgattr_rD[3], flipy=bgattr_rD[2].
+                bg_fx_invert_nxt <= bgattr_rD[2] ^ flip_screen;            // flipX = attr bit 2 (MAME)
+                bg_fy_eff        <= bg_fy ^ {3{bgattr_rD[3] ^ flip_screen}}; // flipY = attr bit 3 (MAME)
+                bg0_addr <= {1'b0, {bgattr_rD[1:0], bgvram_rD}, (bg_fy ^ {3{bgattr_rD[3] ^ flip_screen}})};
+                bg1_addr <= {1'b0, {bgattr_rD[1:0], bgvram_rD}, (bg_fy ^ {3{bgattr_rD[3] ^ flip_screen}})};
+                bg2_addr <= {1'b0, {bgattr_rD[1:0], bgvram_rD}, (bg_fy ^ {3{bgattr_rD[3] ^ flip_screen}})};
             end
             3'd2: begin
                 bg_p0_nxt <= bg0_D;
@@ -736,11 +740,20 @@ wire [8:0] spr_lb_rdata = write_buf ? spr_lb_a_rdata : spr_lb_b_rdata;
 
 // Sprite evaluator FSM (clocked by clk_49m; 24 slots × ~24 clk + 288 clr ≈ 864 clk per scanline,
 // scanline = ~4224 clk_49m cycles → easily fits)
-localparam [3:0] SS_IDLE = 4'd0,  SS_CLR  = 4'd1,  SS_FS0  = 4'd2,  SS_FS1  = 4'd3,
-                 SS_FS2  = 4'd4,  SS_FR0  = 4'd5,  SS_FR1  = 4'd6,  SS_FRL  = 4'd7,
-                 SS_FRR  = 4'd8,  SS_WPX  = 4'd9,  SS_NEXT = 4'd10;
+localparam [4:0] SS_IDLE = 5'd0,  SS_CLR  = 5'd1,  SS_FS0  = 5'd2,  SS_FS1  = 5'd3,
+                 SS_FS2  = 5'd4,  SS_FR0  = 5'd5,  SS_FR1  = 5'd6,  SS_FRL  = 5'd7,
+                 SS_FRR  = 5'd8,  SS_WPX  = 5'd9,  SS_NEXT = 5'd10,
+                 // SPR-READ-LATENCY-FIX-2026-06-13: dpram_dc/eprom q_a are UNREGISTERED
+                 // (outdata_reg_a="UNREGISTERED") → 1-cycle read latency, and the FSM's own
+                 // *_raddr register adds a second, so data for an address set in state N is
+                 // not valid until N+2. The FSM read at N+1 → every slot/gfx fetch sampled
+                 // one cycle early → garbage Y/code → sprites off-screen/missing. The BG FSM
+                 // uses the same primitive but is cen_pix-gated (4 clk/state) so never saw it.
+                 // These *W states are the inserted wait cycles (one per address-set).
+                 SS_FS0W = 5'd11, SS_FS1W = 5'd12, SS_FR0W = 5'd13, SS_FR1W = 5'd14,
+                 SS_FRLW = 5'd15;
 
-reg [3:0] spr_st;
+reg [4:0] spr_st;
 reg [4:0] slot_n;
 reg [8:0] clr_idx;
 reg [3:0] px_idx;
@@ -832,18 +845,20 @@ always_ff @(posedge clk_49m) begin
                     end
                 end
                 SS_FS0: begin
-                    spram0_raddr     <= slot_offs;
-                    fgvram_spr_raddr <= slot_offs + 11'd1;
-                    spram1_raddr     <= slot_offs + 11'd1;
-                    spr_st <= SS_FS1;
+                    spram0_raddr     <= slot_offs;          // area1[offs]   -> sy
+                    fgvram_spr_raddr <= slot_offs + 11'd1;  // area3[offs+1] -> x_lo
+                    spram1_raddr     <= slot_offs + 11'd1;  // area2[offs+1] -> x_hi
+                    spr_st <= SS_FS0W;
                 end
+                SS_FS0W: spr_st <= SS_FS1;                  // wait: dpram read settles (1-cyc latency)
                 SS_FS1: begin
                     sy_y_raw     <= spram0_rD;
                     x_lo_lat     <= fgvram_spr_rD;
                     x_hi_lat     <= spram1_rD[0];
-                    spram0_raddr <= slot_offs + 11'd1;
-                    spr_st       <= SS_FS2;
+                    spram0_raddr <= slot_offs + 11'd1;       // area1[offs+1] -> color
+                    spr_st       <= SS_FS1W;
                 end
+                SS_FS1W: spr_st <= SS_FS2;                  // wait
                 SS_FS2: begin
                     color_lat <= spram0_rD[4:0];
                     sy_full   <= sy_calc;
@@ -855,25 +870,28 @@ always_ff @(posedge clk_49m) begin
                         y_in_tile        <= hit_yint;
                         fgvram_spr_raddr <= slot_offs + {hit_row, 7'd0};
                         spram1_raddr     <= slot_offs + {hit_row, 7'd0};
-                        spr_st           <= SS_FR1;
+                        spr_st           <= SS_FR0W;
                     end else begin
                         spr_st <= SS_NEXT;
                     end
                 end
+                SS_FR0W: spr_st <= SS_FR1;                  // wait: code/attr fetch settles
                 SS_FR1: begin
                     code_lat  <= code_now;
                     flipx_lat <= flipx_now;
                     flipy_lat <= flipy_now;
                     spr_addr  <= {code_now[9:0], y_eff_now[3], 1'b0, y_eff_now[2:0]};   // left half
-                    spr_st    <= SS_FRL;
+                    spr_st    <= SS_FR1W;
                 end
+                SS_FR1W: spr_st <= SS_FRL;                  // wait: gfx ROM read settles
                 SS_FRL: begin
                     p0_l <= spr0_D;
                     p1_l <= spr1_D;
                     p2_l <= spr2_D;
                     spr_addr <= {code_lat[9:0], y_eff_lat[3], 1'b1, y_eff_lat[2:0]};    // right half
-                    spr_st <= SS_FRR;
+                    spr_st <= SS_FRLW;
                 end
+                SS_FRLW: spr_st <= SS_FRR;                  // wait: gfx ROM read settles
                 SS_FRR: begin
                     p0_r   <= spr0_D;
                     p1_r   <= spr1_D;
@@ -914,8 +932,10 @@ wire       spr_opaque         = spr_lb_rdata[8];
 wire [7:0] spr_palette_index  = spr_lb_rdata[7:0];
 wire       fg_opaque          = (fg_pix != 2'b00);
 
-wire [7:0] composite_pal = spr_opaque ? spr_palette_index :
-                           fg_opaque  ? fg_palette_index  :
+// RENDER-LAYER-FIX-2026-06-12: MAME screen_update draws BG → sprites → FG, so FG is ON TOP of sprites.
+// We had sprite>FG>BG (sprites covered the text). Match MAME: FG > sprite > BG.
+wire [7:0] composite_pal = fg_opaque  ? fg_palette_index  :
+                           spr_opaque ? spr_palette_index :
                                         bg_palette_index;
 // 1-clk_49m latency through palette PROMs. 4-bit channel → 5-bit by replicating MSB.
 wire visible = ~hblk & ~vblk;

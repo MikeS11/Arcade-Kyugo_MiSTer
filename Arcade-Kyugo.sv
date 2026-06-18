@@ -216,8 +216,15 @@ assign BUTTONS = 0;
 
 wire [1:0] ar = status[14:13];
 
-assign VIDEO_ARX = status[12] ? ((!ar) ? 12'd4 : (ar - 1'd1)) : ((!ar) ? 12'd3 : (ar - 1'd1));
-assign VIDEO_ARY = status[12] ? ((!ar) ? 12'd3 : 12'd0) : ((!ar) ? 12'd4 : 12'd0);
+// --- Output aspect ratio: follow the GAME orientation, not status[12] alone (mirrors Qix gold) ---
+// Kyugo is MIXED-orientation per MAME ROT (vertical: Gyrodine/Repulse/99/SonOfPhoenix/SRD;
+// horizontal: Flashgal/Legend/Airwolf). 'landscape' reuses the SAME orientation term that drives the
+// rotation's no_rotate wire below (status[12] | core_config[4]), minus the direct_video output-path bit,
+// so the AR can NEVER disagree with screen_rotate — independent of any (possibly-wrong) per-bit comment.
+// Fleet AR audit 2026-06-17. Original keyed off raw status[12], which left the horizontal games squished.
+wire landscape = status[12] | core_config[4];
+assign VIDEO_ARX = landscape ? ((!ar) ? 12'd4 : (ar - 1'd1)) : ((!ar) ? 12'd3 : (ar - 1'd1));
+assign VIDEO_ARY = landscape ? ((!ar) ? 12'd3 : 12'd0)       : ((!ar) ? 12'd4 : 12'd0);
 
 `include "build_id.v"
 localparam CONF_STR = {
