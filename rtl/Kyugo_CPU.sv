@@ -638,7 +638,9 @@ wire [2:0] bg_pix_bit_idx = bg_fx_invert_lat ? bg_fx : ~bg_fx;
 wire bg_p0_bit = bg_p0_lat[bg_pix_bit_idx];
 wire bg_p1_bit = bg_p1_lat[bg_pix_bit_idx];
 wire bg_p2_bit = bg_p2_lat[bg_pix_bit_idx];
-wire [2:0] bg_pix = {bg_p2_bit, bg_p1_bit, bg_p0_bit};
+// DIAG-REVERT-2026-06-18: original below. MAME planeoffset[0]=MSB (plane0=first ROM third); ours had plane0 as LSB → bit-reversed pens → colour-pair swaps.
+// wire [2:0] bg_pix = {bg_p2_bit, bg_p1_bit, bg_p0_bit};
+wire [2:0] bg_pix = {bg_p0_bit, bg_p1_bit, bg_p2_bit};   // PEN-BITORDER-FIX-2026-06-18
 
 wire [7:0] bg_palette_index = {bg_color_lat[4:0], bg_pix[2:0]};
 
@@ -651,10 +653,10 @@ wire [2:0] fg_fx  = bg_sx[2:0];
 wire [2:0] fg_fy  = bg_sy[2:0];
 
 reg  [7:0] fg_code_nxt;
-reg  [4:0] fg_color_nxt;
+reg  [5:0] fg_color_nxt;   // FG-COLORCODE-FIX-2026-06-18: was [4:0]; MAME color=color_codes[4:0]<<1|fgcolor is 6-bit
 reg  [7:0] fg_byte_l_nxt, fg_byte_r_nxt;
 
-reg  [4:0] fg_color_lat;
+reg  [5:0] fg_color_lat;   // FG-COLORCODE-FIX-2026-06-18: was [4:0]
 reg  [7:0] fg_byte_l_lat, fg_byte_r_lat;
 
 // Pipeline timing on cen_pix ticks within the 8-pixel tile:
@@ -673,7 +675,7 @@ always_ff @(posedge clk_49m) begin
                 prom_lut_addr <= fgvram_rD[7:3];
             end
             3'd2: begin
-                fg_color_nxt <= {prom_lut_D[3:0], fgcolor};
+                fg_color_nxt <= {prom_lut_D[4:0], fgcolor};   // FG-COLORCODE-FIX-2026-06-18: was prom_lut_D[3:0] — dropped color_codes bit4 (locked FG to palette 0-127)
                 fgtile_addr  <= {fg_code_nxt, 1'b0, fg_fy};   // left chunk byte at offset y
             end
             3'd3: begin
@@ -698,11 +700,13 @@ wire [7:0] fg_byte_sel = fg_fx[2] ? fg_byte_r_lat : fg_byte_l_lat;
 wire [1:0] fg_xic      = ~fg_fx[1:0];
 wire fg_p0_bit = fg_byte_sel[{1'b1, fg_xic}];   // bit (4 + ~x_in_chunk) = (7 - x_in_chunk)
 wire fg_p1_bit = fg_byte_sel[{1'b0, fg_xic}];   // bit (0 + ~x_in_chunk) = (3 - x_in_chunk)
-wire [1:0] fg_pix = {fg_p1_bit, fg_p0_bit};
+// DIAG-REVERT-2026-06-18: original below. plane0 (fg_p0_bit, high nibble) must be the MSB per MAME planeoffset[0]; was LSB → pen1↔pen2 swap.
+// wire [1:0] fg_pix = {fg_p1_bit, fg_p0_bit};
+wire [1:0] fg_pix = {fg_p0_bit, fg_p1_bit};   // PEN-BITORDER-FIX-2026-06-18
 
 // FG palette index: ((color_codes[code>>3] << 1 | fgcolor) << 2) | pen
 //   = {color_codes[3:0], fgcolor, pen[1:0]} (7 bits, padded to 8)
-wire [7:0] fg_palette_index = {1'b0, fg_color_lat[4:0], fg_pix[1:0]};
+wire [7:0] fg_palette_index = {fg_color_lat[5:0], fg_pix[1:0]};   // FG-COLORCODE-FIX-2026-06-18: was {1'b0, fg_color_lat[4:0], ...} which forced palette bit7=0 → FG = {color_codes[4:0], fgcolor, pen} per MAME
 
 //----------------------------------------------- Sprite engine (Phase 7) -------------------------------------------//
 
@@ -808,7 +812,9 @@ wire [2:0] bit_idx    = ~tile_x_eff[2:0];   // 7 - tile_x_eff[2:0]
 wire       pix_p0     = byte0[bit_idx];
 wire       pix_p1     = byte1[bit_idx];
 wire       pix_p2     = byte2[bit_idx];
-wire [2:0] spr_pix    = {pix_p2, pix_p1, pix_p0};
+// DIAG-REVERT-2026-06-18: original below. Same plane-order reversal as BG (plane0=spr0=first ROM third = MAME MSB).
+// wire [2:0] spr_pix    = {pix_p2, pix_p1, pix_p0};
+wire [2:0] spr_pix    = {pix_p0, pix_p1, pix_p2};   // PEN-BITORDER-FIX-2026-06-18
 wire [7:0] spr_pal_idx = {color_lat[4:0], spr_pix[2:0]};
 
 wire signed [10:0] sx_signed       = {{2{sx_full[8]}}, sx_full};
