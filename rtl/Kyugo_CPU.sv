@@ -116,14 +116,17 @@ assign video_hsync = (h_cnt_sync >= hs_start && h_cnt_sync < hs_end);
 assign video_vsync = (v_cnt_sync >= vs_start && v_cnt_sync < vs_end);
 assign video_csync = ~(video_hsync ^ video_vsync);
 
-// DIAG-REVERT-2026-05-29 (watchdog): combined CPU-subsystem reset = power reset OR a
-// Gyrodine watchdog soft-reboot pulse (wdog_rst, driven by the watchdog block below).
-// reset_cpu feeds both Z80s + the LS259 mainlatch + NMI/IRQ state, so a watchdog timeout
-// restarts the whole main subsystem like a real board reset (RAM is NOT cleared — the
-// boot self-test re-inits it, matching hardware). KILL SWITCH: set wdog_arm = 1'b0 and
-// reset_cpu becomes identical to reset (watchdog fully neutered, no other change needed).
+// *** HACK — REQUIRED FOR BOOT, DO NOT REMOVE (cold-boot SUB CHECK is UNSOLVED) ***
+// combined CPU-subsystem reset = power reset OR a watchdog soft-reboot pulse (wdog_rst, from the
+// watchdog block below). reset_cpu pulses both Z80s + the LS259 mainlatch + NMI/IRQ state, like a
+// real board reset (RAM NOT cleared — the boot self-test re-inits it).
+// WHY IT'S A HACK: on COLD power-up the sub never writes its F004 handshake token → the main waits
+// on it forever (the real root cause, STILL UNFIXED). We MASK it by leaning on the (Gyrodine)
+// watchdog: main stops kicking E000 → ~2s timeout → RAM-preserving reset → the retry passes, like
+// a manual light reset. Proper fix = the sub-side cold-boot handshake. Until then this STAYS, or
+// the game won't boot. KILL SWITCH (only to work the real root): wdog_arm = 1'b0 → reset_cpu == reset.
 wire       wdog_rst;            // forward ref — assigned in the watchdog block below
-wire       wdog_arm = 1'b1;     // RE-ARMED: auto-recovers the cold-boot SUB-CHECK lock (main stops kicking E000 → ~2s → RAM-preserving reset → retry passes, like a manual light reset). Set 1'b0 to disable.
+wire       wdog_arm = 1'b1;     // 1 = HACK ARMED (masks the unsolved cold-boot SUB CHECK; required to boot).
 wire       reset_cpu = reset & ~(wdog_rst & wdog_arm);
 
 //------------------------------------------------------- CPU1 — Main ---------------------------------------------------------//
@@ -142,7 +145,7 @@ T80s cpu1
 );
 
 // NMI: scanline 240, gated by nmi_mask.
-// DIAG-REVERT-2026-05-29 (NMI WIDTH): the T80 samples NMI_n for a FALLING EDGE only on CEN
+// NMI WIDTH (real fix): the T80 samples NMI_n for a FALLING EDGE only on CEN
 // ticks (OldNMI_n updates on CEN). A pulse narrower than one cen_cpu period can fall between
 // two CEN samples and be MISSED (see HDL/"Z80 NMI is edge-triggered sampled on CEN", surfaced
 // on Kangaroo). The OLD clear-on-M1 made the pulse phase-sensitively narrow — when v_cnt==240
@@ -150,7 +153,6 @@ T80s cpu1
 // → the boot/attract LOCK (pause/unpause re-phased the pulse wider → NMI taken → escaped).
 // FIX: hold NMI for a FIXED ~16 cen_cpu ticks so the edge is always sampled. Edge-triggered,
 // so the wide level is still exactly ONE NMI; ~16 CPU cycles releases long before next frame.
-// Original clear-on-M1 commented below.
 reg cpu1_nmi = 1'b0;
 reg [4:0] nmi_cnt = 5'd0;
 always_ff @(posedge clk_49m) begin
@@ -162,9 +164,6 @@ always_ff @(posedge clk_49m) begin
 		nmi_cnt <= nmi_cnt - 5'd1;
 		if (nmi_cnt == 5'd1) cpu1_nmi <= 1'b0;     // release after ~16 cen_cpu ticks
 	end
-	// ORIGINAL (too narrow — cleared on the next opcode fetch, phase-sensitive miss):
-	// if (cen_pix && base_h_cnt==9'd0 && v_cnt==9'd240 && nmi_mask) cpu1_nmi <= 1;
-	// if (~cpu1_MREQ_n & ~cpu1_M1_n) cpu1_nmi <= 0;
 end
 
 //-------------------------------------------------- CPU1 Address Decoding (variant-aware) ------------------------------//
@@ -198,25 +197,11 @@ always_ff @(posedge clk_49m) begin
 	if (!reset_cpu) mainlatch <= 8'd0;  // reset_cpu: +watchdog (a real soft-reset clears the LS259)
 	else if (cen_cpu && cs_mainlatch) mainlatch[cpu1_A[2:0]] <= cpu1_Dout[0];
 end
-// DIAG-REVERT-2026-05-29: NMI bootstrap (v3). The main loop is vblank-NMI-driven, but the
-// main can't reach its own OUT(0),1 (set mainlatch[0]=NMI-enable) until a cpu1<->cpu2
-// shared-RAM handshake completes — and that handshake needs the NMI loop already running
-// => a boot deadlock. Evolution:
-//   v1 (= 1'b1): forced from reset — broke the deadlock but skipped flip/sub-release init.
-//   v2 (= mainlatch[0]|mainlatch[2]): forced after sub-release — boots + video + audio all
-//       work, BUT it keeps NMI on FOREVER; the game clears mainlatch[0] during attract
-//       VRAM setup and the forced NMI corrupts it => garbage tiles + lock at attract.
-//   v3 (below): force ONLY as a bootstrap, then hand control back. The strip probe proved
-//       the main DOES set mainlatch[0] itself (ml0 cell black->blue) and the sub DOES
-//       write shared RAM. So once the main has taken NMI control (ml0_seen), follow the
-//       REAL mainlatch[0] — letting the game disable NMI when it needs to.
-// DIAG-REVERT-2026-05-29 (NMI BOOTSTRAP REMOVED): v3 force-enabled NMI after sub-release until
-// the main set mainlatch[0] — a band-aid for the "boot deadlock," which we now believe WAS the
-// missed-NMI bug (narrow pulse dropped on CEN), now fixed in the cpu1_nmi block. With reliable
-// NMI, the forced bootstrap pulse instead slams into early init at a phase-dependent point →
-// FLAKY STARTUP (runtime is already stable). Reverted to the real nmi_mask = mainlatch[0] so the
-// game enables its own vblank NMI when ready. If this re-introduces a boot deadlock, the
-// bootstrap was needed for a separate reason → restore the v3 line + use of ml0_seen below.
+// NMI enable = the game's own mainlatch[0]. An earlier "NMI bootstrap" force-enabled NMI to break
+// an apparent boot deadlock; that deadlock turned out to be the missed-NMI bug (narrow pulse dropped
+// on CEN), now fixed in the cpu1_nmi block above — so the bootstrap was removed (it caused flaky
+// startup once NMI was reliable). The v3 bootstrap is kept COMMENTED below as a restore path in case
+// a real boot deadlock ever reappears.
 reg ml0_seen = 1'b0;   // kept (unused now) for easy restore of the v3 bootstrap
 always_ff @(posedge clk_49m) begin
 	if (!reset_cpu)        ml0_seen <= 1'b0;
@@ -229,7 +214,7 @@ wire flip_screen = 1'b0; // rot_flip ^ mainlatch[1];
 wire cpu2_rst    = ~mainlatch[2];
 
 //------------------------------------------------------- Watchdog (Gyrodine) -------------------------------------------------//
-// DIAG-REVERT-2026-05-29 (watchdog): MAME gyrodine() adds WATCHDOG_TIMER; map(0xe000).w =
+// Watchdog (the cold-boot SUB-CHECK recovery hack — see wdog_arm above): MAME gyrodine() adds WATCHDOG_TIMER; map(0xe000).w =
 // watchdog reset. A write to E000 kicks it; if the main CPU stops kicking for WDOG_TIMEOUT
 // frames, the board soft-resets (assert wdog_rst -> reset_cpu pulses both Z80s + the LS259
 // + NMI state, re-running boot). Gyrodine-only: other variants never increment so never
@@ -372,9 +357,8 @@ eprom_32k main_rom (.CLK(clk_49m), .ADDR(cpu1_A[14:0]), .CLK_DL(clk_49m),
 	.ADDR_DL(ioctl_addr), .DATA_IN(ioctl_data), .CS_DL(main_rom_cs_i), .WR(ioctl_wr), .DATA(main_rom_D));
 
 wire [7:0] sub_rom_D;
-// DIAG-REVERT-2026-05-29 (sub_rom 16K→32K): sister games (Repulse/Flashgal/SonOfPhoenix) have
-// 32KB sub ROMs; eprom_16k truncated them. Gyrodine (8KB sub) uses only the low 8KB → unaffected.
-// Original: eprom_16k sub_rom (.ADDR(cpu2_A[13:0]) ...)
+// sub_rom is 32KB (eprom_32k): sister games (Repulse/Flashgal/SonOfPhoenix) have 32KB sub ROMs;
+// eprom_16k truncated them. Gyrodine (8KB sub) uses only the low 8KB → unaffected.
 eprom_32k sub_rom (.CLK(clk_49m), .ADDR(cpu2_A[14:0]), .CLK_DL(clk_49m),
 	.ADDR_DL(ioctl_addr), .DATA_IN(ioctl_data), .CS_DL(sub_rom_cs_i), .WR(ioctl_wr), .DATA(sub_rom_D));
 
@@ -607,7 +591,6 @@ always_ff @(posedge clk_49m) begin
                 // BG-FLIP-SWAP-FIX-2026-06-12: MAME get_bg_tile_info uses TILE_FLIPYX((attr&0x0c)>>2) ⇒
                 // flipX = attr BIT 2, flipY = attr BIT 3. We had them swapped (bit3/bit2 = the SPRITE
                 // convention), mirroring BG tiles on the wrong axis. (FG has no per-tile flip — correct.)
-                // Was: flipx=bgattr_rD[3], flipy=bgattr_rD[2].
                 bg_fx_invert_nxt <= bgattr_rD[2] ^ flip_screen;            // flipX = attr bit 2 (MAME)
                 bg_fy_eff        <= bg_fy ^ {3{bgattr_rD[3] ^ flip_screen}}; // flipY = attr bit 3 (MAME)
                 bg0_addr <= {1'b0, {bgattr_rD[1:0], bgvram_rD}, (bg_fy ^ {3{bgattr_rD[3] ^ flip_screen}})};
@@ -638,9 +621,8 @@ wire [2:0] bg_pix_bit_idx = bg_fx_invert_lat ? bg_fx : ~bg_fx;
 wire bg_p0_bit = bg_p0_lat[bg_pix_bit_idx];
 wire bg_p1_bit = bg_p1_lat[bg_pix_bit_idx];
 wire bg_p2_bit = bg_p2_lat[bg_pix_bit_idx];
-// DIAG-REVERT-2026-06-18: original below. MAME planeoffset[0]=MSB (plane0=first ROM third); ours had plane0 as LSB → bit-reversed pens → colour-pair swaps.
-// wire [2:0] bg_pix = {bg_p2_bit, bg_p1_bit, bg_p0_bit};
-wire [2:0] bg_pix = {bg_p0_bit, bg_p1_bit, bg_p2_bit};   // PEN-BITORDER-FIX-2026-06-18
+// Pen = {plane0, plane1, plane2}: MAME planeoffset[0] (= first ROM third, bg0) is the MSB.
+wire [2:0] bg_pix = {bg_p0_bit, bg_p1_bit, bg_p2_bit};
 
 wire [7:0] bg_palette_index = {bg_color_lat[4:0], bg_pix[2:0]};
 
@@ -653,10 +635,10 @@ wire [2:0] fg_fx  = bg_sx[2:0];
 wire [2:0] fg_fy  = bg_sy[2:0];
 
 reg  [7:0] fg_code_nxt;
-reg  [5:0] fg_color_nxt;   // FG-COLORCODE-FIX-2026-06-18: was [4:0]; MAME color=color_codes[4:0]<<1|fgcolor is 6-bit
+reg  [5:0] fg_color_nxt;   // 6-bit colour code: MAME color = color_codes[4:0]<<1 | fgcolor
 reg  [7:0] fg_byte_l_nxt, fg_byte_r_nxt;
 
-reg  [5:0] fg_color_lat;   // FG-COLORCODE-FIX-2026-06-18: was [4:0]
+reg  [5:0] fg_color_lat;
 reg  [7:0] fg_byte_l_lat, fg_byte_r_lat;
 
 // Pipeline timing on cen_pix ticks within the 8-pixel tile:
@@ -675,7 +657,7 @@ always_ff @(posedge clk_49m) begin
                 prom_lut_addr <= fgvram_rD[7:3];
             end
             3'd2: begin
-                fg_color_nxt <= {prom_lut_D[4:0], fgcolor};   // FG-COLORCODE-FIX-2026-06-18: was prom_lut_D[3:0] — dropped color_codes bit4 (locked FG to palette 0-127)
+                fg_color_nxt <= {prom_lut_D[4:0], fgcolor};   // full 5-bit colour code from the LUT + fgcolor bank bit
                 fgtile_addr  <= {fg_code_nxt, 1'b0, fg_fy};   // left chunk byte at offset y
             end
             3'd3: begin
@@ -700,13 +682,12 @@ wire [7:0] fg_byte_sel = fg_fx[2] ? fg_byte_r_lat : fg_byte_l_lat;
 wire [1:0] fg_xic      = ~fg_fx[1:0];
 wire fg_p0_bit = fg_byte_sel[{1'b1, fg_xic}];   // bit (4 + ~x_in_chunk) = (7 - x_in_chunk)
 wire fg_p1_bit = fg_byte_sel[{1'b0, fg_xic}];   // bit (0 + ~x_in_chunk) = (3 - x_in_chunk)
-// DIAG-REVERT-2026-06-18: original below. plane0 (fg_p0_bit, high nibble) must be the MSB per MAME planeoffset[0]; was LSB → pen1↔pen2 swap.
-// wire [1:0] fg_pix = {fg_p1_bit, fg_p0_bit};
-wire [1:0] fg_pix = {fg_p0_bit, fg_p1_bit};   // PEN-BITORDER-FIX-2026-06-18
+// Pen = {plane0, plane1}: plane0 (fg_p0_bit, high nibble) is the MSB per MAME planeoffset[0].
+wire [1:0] fg_pix = {fg_p0_bit, fg_p1_bit};
 
 // FG palette index: ((color_codes[code>>3] << 1 | fgcolor) << 2) | pen
 //   = {color_codes[3:0], fgcolor, pen[1:0]} (7 bits, padded to 8)
-wire [7:0] fg_palette_index = {fg_color_lat[5:0], fg_pix[1:0]};   // FG-COLORCODE-FIX-2026-06-18: was {1'b0, fg_color_lat[4:0], ...} which forced palette bit7=0 → FG = {color_codes[4:0], fgcolor, pen} per MAME
+wire [7:0] fg_palette_index = {fg_color_lat[5:0], fg_pix[1:0]};   // {color_codes[4:0], fgcolor, pen[1:0]} per MAME
 
 //----------------------------------------------- Sprite engine (Phase 7) -------------------------------------------//
 
@@ -812,9 +793,8 @@ wire [2:0] bit_idx    = ~tile_x_eff[2:0];   // 7 - tile_x_eff[2:0]
 wire       pix_p0     = byte0[bit_idx];
 wire       pix_p1     = byte1[bit_idx];
 wire       pix_p2     = byte2[bit_idx];
-// DIAG-REVERT-2026-06-18: original below. Same plane-order reversal as BG (plane0=spr0=first ROM third = MAME MSB).
-// wire [2:0] spr_pix    = {pix_p2, pix_p1, pix_p0};
-wire [2:0] spr_pix    = {pix_p0, pix_p1, pix_p2};   // PEN-BITORDER-FIX-2026-06-18
+// Pen = {plane0, plane1, plane2}: MAME planeoffset[0] (= first ROM third, spr0) is the MSB.
+wire [2:0] spr_pix    = {pix_p0, pix_p1, pix_p2};
 wire [7:0] spr_pal_idx = {color_lat[4:0], spr_pix[2:0]};
 
 wire signed [10:0] sx_signed       = {{2{sx_full[8]}}, sx_full};
@@ -1248,18 +1228,14 @@ always_comb begin
     if (hs_row_pc    & hs_cpu2_m1_ever & (base_h_cnt >= 9'd128))    begin hs_r=5'd31; hs_b=5'd31; end              // MAGENTA right half = sub CPU fetched opcode
 end
 
-// DIAG-2026-05-29: full overlay OFF (game running); only the THIN ROW-3 STRIP (v_cnt
-// 16..23) is overlaid so we keep the picture AND read the sub-handshake. Restore the
-// pristine render = drop `diag_strip ? strip_* :` from the 3 lines below. Re-arm the FULL
-// overlay = use the 4 fully-commented lines at the very bottom instead.
-// DIAG-REVERT-2026-05-29: video output mux — THREE options, exactly ONE triplet active.
-//   (1) PRISTINE: clean game render, no overlay (use for a pure "does it lock?" test).
-//   (2) LOCK PROBE (ACTIVE): overlays recent-activity cells (v_cnt 16..31) + PC bar
-//       (32..63) to read WHERE the main CPU is stuck during a lock. Independent of the
-//       hiscore disable — if it still locks, the cells tell us where, no second compile.
-//   (3) STRIP (old committed): sub-handshake strip on the live game.
+// Video output mux. PRISTINE (clean game render) is ACTIVE. The diagnostic overlays below are kept
+// COMMENTED for re-arming (handy for the open scrolling + cold-boot work); exactly ONE triplet is
+// active at a time. To re-arm a probe: comment the PRISTINE triplet and uncomment one of —
+//   (2) LOCK PROBE     — activity cells (v_cnt 16..31) + PC bar (32..63): where the main CPU is stuck.
+//   (3) STRIP          — sub-handshake strip overlaid on the live game.
+//   (4) HANDSHAKE PROBE — full main<->sub shared-RAM handshake read.
+//   FULL OVERLAY       — rows 1/2 + PC bar + PALETTE SWATCH (also swap in the diag_swatch prom_addr line).
 assign prom_addr = composite_pal;
-// (1) PRISTINE — ACTIVE (clean video for the phase-fix boot→attract test):
 // (1) PRISTINE — ACTIVE (overlay OFF for screenshots; re-arm a probe below to debug):
 assign red   = !visible ? 5'd0 : {prom_r_D[3:0], prom_r_D[3]};
 assign green = !visible ? 5'd0 : {prom_g_D[3:0], prom_g_D[3]};
