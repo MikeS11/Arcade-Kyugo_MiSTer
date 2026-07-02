@@ -210,7 +210,27 @@ end
 wire nmi_mask = mainlatch[0];   // REAL: the game controls its own vblank-NMI enable
 // v3 bootstrap (removed — restore if boot deadlocks):
 // wire nmi_mask = ml0_seen ? mainlatch[0] : (mainlatch[0] | mainlatch[2]);
-wire flip_screen = 1'b0; // rot_flip ^ mainlatch[1];
+// FLIP-SCREEN-FIX-2026-07-01: was hardcoded 1'b0 (stubbed during initial bring-up, never
+// revisited). Verified via Gyrodine's own disassembly (Useful Information/gyrodine.dasm) —
+// its reset vector ($7E85, confirmed as the real boot entry via the `jp $7E85` at $0005)
+// unconditionally does `ld a,$01 / out ($01),a` at $7E92-7E94, setting mainlatch bit 1
+// (flip_screen) to 1 as a hardcoded part of ITS OWN boot code — not DIP-driven (DIP
+// Cabinet default is identical Upright across Gyrodine/Repulse/SRD Mission, checked and
+// ruled out). Our RTL's LS259 mainlatch emulation (line ~195-198) already correctly
+// implements the write_d0 semantics (address selects bit, data bit0 sets/clears) and this
+// exact bit was already probed once before (`ml1_ever`, "proves LS259 writes land") — so
+// mainlatch[1] itself is trustworthy, it just wasn't being read. MAME's own flip_screen()
+// (kyugo.cpp) is a PURE reflection of this latch bit — no XOR with anything else, so the
+// old commented-out `rot_flip ^ mainlatch[1]` reference was itself wrong (conflating
+// MAME's per-game flip signal with our separate rotation-direction bit).
+// NOT yet addressed by this fix (flag for follow-up, don't guess-fix in the same commit):
+// (1) our BG code responds to flip_screen by mirroring the screen coordinate (base_h_cnt
+//     -> 287-base_h_cnt); MAME instead negates the scroll register and leaves the
+//     coordinate alone — these aren't the same transform, may need reconciling once this
+//     is live and testable. (2) sprite draw has ZERO flip_screen handling at all (MAME
+//     mirrors sprite Y, inverts per-sprite flipX/flipY, reverses row-stacking order when
+//     flipped) — if sprites look wrong after this compile, that's why.
+wire flip_screen = mainlatch[1];
 wire cpu2_rst    = ~mainlatch[2];
 
 //------------------------------------------------------- Watchdog (Gyrodine) -------------------------------------------------//
@@ -580,7 +600,22 @@ wire [2:0] bg_fy  = bg_world_y[2:0];
 // transform. Does NOT address the separate missing-HUD-icon symptom at the same
 // x-position (sprite/line-buffer swap logic resets at the same base_h_cnt==0 boundary,
 // Kyugo_CPU.sv:707-818, but via a different mechanism — untouched here).
-wire bg_row_lookahead = (base_h_cnt >= 9'd388);   // last 8 ticks of blanking (388..395)
+// WINDOW-WIDEN-FIX-2026-07-01: was `base_h_cnt >= 9'd388` (an 8-tick window). Bug found by
+// hand-tracing: the trigger this window relies on (bg_fx==0) doesn't always land at the
+// START of an 8-tick span — WHERE it lands within any 8 consecutive ticks depends on
+// scroll_x_full's low bits, which change continuously during scrolling. If bg_fx==0 lands
+// late in the window (close to tick 395), the 7-tick fetch+promote sequence spills PAST
+// the wrap into the new line's first few active pixels, leaving stale data visible for
+// however many pixels it overran by — and since scroll changes every frame during motion,
+// the overrun amount changes every frame too, matching the reported "worse when in
+// motion, same [not good] in stills" (a frozen scroll value gives a consistent, but not
+// necessarily complete, result). Worked the worst case: for ALL 8 possible scroll-phase
+// offsets, a window of 16 ticks (380..395) is guaranteed to contain at least one COMPLETE
+// fx 0-7 cycle that finishes at or before the wrap, regardless of phase. Widened from 8 to
+// 16 ticks. (Two-cycles-when-phase-is-early is harmless — bg_fetch_row/bg_fetch_col are
+// constant "column 0 of next row" throughout the whole window, so a redundant earlier
+// completion just gets safely overwritten by the correct later one.)
+wire bg_row_lookahead = (base_h_cnt >= 9'd380);   // last 16 ticks of blanking (380..395)
 
 wire [8:0] v_cnt_next      = (v_cnt == 9'd259) ? 9'd0 : (v_cnt + 9'd1);
 wire [8:0] bg_sy_next      = flip_screen ? (9'd239 - v_cnt_next) : v_cnt_next;
@@ -594,6 +629,16 @@ wire [5:0] bg_col_zero          = bg_world_x_zero[8:3];
 
 wire [4:0] bg_fetch_row = bg_row_lookahead ? bg_row_next : bg_row;
 wire [5:0] bg_fetch_col = bg_row_lookahead ? bg_col_zero : (bg_col + 6'd1);
+
+// FINE-Y-LOOKAHEAD-FIX-2026-07-01: the coarse row/col above were correctly overridden to
+// target the NEXT row during the lookahead window, but the FINE within-tile Y (bg_fy) used
+// below to address the actual GFX ROM plane data was NOT — it stayed on bg_world_y (built
+// from the OLD, not-yet-incremented v_cnt) throughout. Since fine-Y usually just increments
+// by 1 across a row boundary, this fetched the tile's CORRECT row-of-tiles but the WRONG
+// scanline-within-that-tile (one row stale) for the one tile this window covers — exactly
+// the reported symptom: a single 8px-wide column (the lookahead-fetched tile), off by
+// exactly one pixel row, everything else on screen unaffected.
+wire [2:0] bg_fetch_fy = bg_row_lookahead ? bg_world_y_next[2:0] : bg_fy;
 
 // "next" = data being fetched for the upcoming 8-pixel tile
 // "lat" = data for the currently-displaying 8-pixel tile
@@ -629,10 +674,12 @@ always_ff @(posedge clk_49m) begin
                 // flipX = attr BIT 2, flipY = attr BIT 3. We had them swapped (bit3/bit2 = the SPRITE
                 // convention), mirroring BG tiles on the wrong axis. (FG has no per-tile flip — correct.)
                 bg_fx_invert_nxt <= bgattr_rD[2] ^ flip_screen;            // flipX = attr bit 2 (MAME)
-                bg_fy_eff        <= bg_fy ^ {3{bgattr_rD[3] ^ flip_screen}}; // flipY = attr bit 3 (MAME)
-                bg0_addr <= {1'b0, {bgattr_rD[1:0], bgvram_rD}, (bg_fy ^ {3{bgattr_rD[3] ^ flip_screen}})};
-                bg1_addr <= {1'b0, {bgattr_rD[1:0], bgvram_rD}, (bg_fy ^ {3{bgattr_rD[3] ^ flip_screen}})};
-                bg2_addr <= {1'b0, {bgattr_rD[1:0], bgvram_rD}, (bg_fy ^ {3{bgattr_rD[3] ^ flip_screen}})};
+                // FINE-Y-LOOKAHEAD-FIX-2026-07-01: was bg_fy (unconditional) in all 4 lines below —
+                // see the bg_fetch_fy wire declaration above for why this needs the lookahead-aware value.
+                bg_fy_eff        <= bg_fetch_fy ^ {3{bgattr_rD[3] ^ flip_screen}}; // flipY = attr bit 3 (MAME)
+                bg0_addr <= {1'b0, {bgattr_rD[1:0], bgvram_rD}, (bg_fetch_fy ^ {3{bgattr_rD[3] ^ flip_screen}})};
+                bg1_addr <= {1'b0, {bgattr_rD[1:0], bgvram_rD}, (bg_fetch_fy ^ {3{bgattr_rD[3] ^ flip_screen}})};
+                bg2_addr <= {1'b0, {bgattr_rD[1:0], bgvram_rD}, (bg_fetch_fy ^ {3{bgattr_rD[3] ^ flip_screen}})};
             end
             3'd2: begin
                 bg_p0_nxt <= bg0_D;
@@ -683,6 +730,12 @@ wire [5:0] fg_col_zero = bg_sx_zero[8:3];
 wire [4:0] fg_fetch_row = bg_row_lookahead ? fg_row_next : fg_row;
 wire [5:0] fg_fetch_col = bg_row_lookahead ? fg_col_zero : (fg_col + 6'd1);
 
+// FINE-Y-LOOKAHEAD-FIX-2026-07-01: same class of bug as BG's bg_fetch_fy above — fg_row/col
+// were overridden for the lookahead window but fg_fy (used below to address the FG tile ROM)
+// was not, fetching the right tile but the wrong scanline within it (one row stale) for the
+// lookahead-fetched tile specifically.
+wire [2:0] fg_fetch_fy = bg_row_lookahead ? bg_sy_next[2:0] : fg_fy;
+
 reg  [7:0] fg_code_nxt;
 reg  [5:0] fg_color_nxt;   // 6-bit colour code: MAME color = color_codes[4:0]<<1 | fgcolor
 reg  [7:0] fg_byte_l_nxt, fg_byte_r_nxt;
@@ -708,11 +761,12 @@ always_ff @(posedge clk_49m) begin
             end
             3'd2: begin
                 fg_color_nxt <= {prom_lut_D[4:0], fgcolor};   // full 5-bit colour code from the LUT + fgcolor bank bit
-                fgtile_addr  <= {fg_code_nxt, 1'b0, fg_fy};   // left chunk byte at offset y
+                // FINE-Y-LOOKAHEAD-FIX-2026-07-01: was fg_fy (unconditional) in both lines below.
+                fgtile_addr  <= {fg_code_nxt, 1'b0, fg_fetch_fy};   // left chunk byte at offset y
             end
             3'd3: begin
                 fg_byte_l_nxt <= fgtile_D;
-                fgtile_addr   <= {fg_code_nxt, 1'b1, fg_fy};   // right chunk byte at offset y+8
+                fgtile_addr   <= {fg_code_nxt, 1'b1, fg_fetch_fy};   // right chunk byte at offset y+8
             end
             3'd4: fg_byte_r_nxt <= fgtile_D;
             3'd7: begin
