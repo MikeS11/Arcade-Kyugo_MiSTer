@@ -561,6 +561,40 @@ wire [4:0] bg_row = bg_world_y[7:3];   // 0..31
 wire [2:0] bg_fx  = bg_world_x[2:0];   // 0..7
 wire [2:0] bg_fy  = bg_world_y[2:0];
 
+// BG-ROWWRAP-LOOKAHEAD-FIX-2026-07-01: base_h_cnt's total period (396) is the
+// MAME-verified real hardware value (Useful Information/kyugo.cpp:946 —
+// screen.set_raw(18.432_MHz_XTAL/3, 396, 0, 288, 260, 16, 240)) and is NOT a multiple
+// of 8. That's fine for HSYNC (matches real hardware) but the BG fetch-ahead pipeline
+// below needs one full 8-tick window to fetch+latch+promote a tile before it's
+// displayed — and v_cnt (the row) only increments at the SAME tick base_h_cnt wraps
+// 395->0, too late for column 0 of the new row to be ready in time. Real hardware must
+// anticipate the row change a bit early; we do the same: during the LAST 8 ticks of
+// blanking, override the fetch target to "column 0 of the UPCOMING row" (v_cnt_next)
+// instead of the normal same-row off-screen lookahead column. bg_fx is glitch-free
+// through this whole window (the only discontinuity is the single 395->0 tick, which
+// falls right at this window's end), so the fx==0/1/2/7 sequence still fires cleanly
+// once each inside it — promote (fx==7) always lands in time for base_h_cnt==0.
+// Symptom this fixes: stale/wrong-stage BG tile data at one screen edge every line —
+// vertical band on Flashgal (no_rotate), horizontal band on Gyrodine (rotated) — same
+// root cause, axis differs only because screen_rotate is a downstream, content-agnostic
+// transform. Does NOT address the separate missing-HUD-icon symptom at the same
+// x-position (sprite/line-buffer swap logic resets at the same base_h_cnt==0 boundary,
+// Kyugo_CPU.sv:707-818, but via a different mechanism — untouched here).
+wire bg_row_lookahead = (base_h_cnt >= 9'd388);   // last 8 ticks of blanking (388..395)
+
+wire [8:0] v_cnt_next      = (v_cnt == 9'd259) ? 9'd0 : (v_cnt + 9'd1);
+wire [8:0] bg_sy_next      = flip_screen ? (9'd239 - v_cnt_next) : v_cnt_next;
+wire [8:0] bg_world_y_next = bg_sy_next + {1'b0, scroll_y_r};
+wire [4:0] bg_row_next     = bg_world_y_next[7:3];
+
+wire [8:0] bg_sx_zero           = flip_screen ? 9'd287 : 9'd0;
+wire [9:0] bg_world_x_zero_pre  = {1'b0, bg_sx_zero} + {1'b0, scroll_x_full} + 10'd32;
+wire [8:0] bg_world_x_zero      = bg_world_x_zero_pre[8:0];
+wire [5:0] bg_col_zero          = bg_world_x_zero[8:3];
+
+wire [4:0] bg_fetch_row = bg_row_lookahead ? bg_row_next : bg_row;
+wire [5:0] bg_fetch_col = bg_row_lookahead ? bg_col_zero : (bg_col + 6'd1);
+
 // "next" = data being fetched for the upcoming 8-pixel tile
 // "lat" = data for the currently-displaying 8-pixel tile
 reg  [9:0] bg_code_nxt;
@@ -582,8 +616,11 @@ always_ff @(posedge clk_49m) begin
     if (cen_pix) begin
         case (bg_fx)
             3'd0: begin
-                bgvram_raddr <= {bg_row, bg_col + 6'd1};
-                bgattr_raddr <= {bg_row, bg_col + 6'd1};
+                // BG-ROWWRAP-LOOKAHEAD-FIX-2026-07-01: was {bg_row, bg_col + 6'd1}
+                // unconditionally — see the wire declarations above for why this needs
+                // to target the NEXT row's column 0 during the last 8 blanking ticks.
+                bgvram_raddr <= {bg_fetch_row, bg_fetch_col};
+                bgattr_raddr <= {bg_fetch_row, bg_fetch_col};
             end
             3'd1: begin
                 bg_code_nxt      <= {bgattr_rD[1:0], bgvram_rD};
@@ -634,6 +671,18 @@ wire [4:0] fg_row = bg_sy[7:3];
 wire [2:0] fg_fx  = bg_sx[2:0];
 wire [2:0] fg_fy  = bg_sy[2:0];
 
+// FG-ROWWRAP-LOOKAHEAD-FIX-2026-07-01: FG has its OWN independent fetch-ahead pipeline
+// (below) and derives fg_fx straight from bg_sx[2:0] — since FG has no scroll, this tracks
+// base_h_cnt even more directly than BG's did, so it has the exact same row-wrap
+// discontinuity as BG-ROWWRAP-LOOKAHEAD-FIX-2026-07-01 above (see that comment for the
+// full mechanism). Reuses bg_row_lookahead/bg_sy_next/bg_sx_zero since FG's world coords
+// ARE the screen coords (no scroll offset to add).
+wire [4:0] fg_row_next = bg_sy_next[7:3];
+wire [5:0] fg_col_zero = bg_sx_zero[8:3];
+
+wire [4:0] fg_fetch_row = bg_row_lookahead ? fg_row_next : fg_row;
+wire [5:0] fg_fetch_col = bg_row_lookahead ? fg_col_zero : (fg_col + 6'd1);
+
 reg  [7:0] fg_code_nxt;
 reg  [5:0] fg_color_nxt;   // 6-bit colour code: MAME color = color_codes[4:0]<<1 | fgcolor
 reg  [7:0] fg_byte_l_nxt, fg_byte_r_nxt;
@@ -651,7 +700,8 @@ reg  [7:0] fg_byte_l_lat, fg_byte_r_lat;
 always_ff @(posedge clk_49m) begin
     if (cen_pix) begin
         case (fg_fx)
-            3'd0: fgvram_raddr <= {fg_row, fg_col + 6'd1};
+            // FG-ROWWRAP-LOOKAHEAD-FIX-2026-07-01: was {fg_row, fg_col + 6'd1} unconditionally.
+            3'd0: fgvram_raddr <= {fg_fetch_row, fg_fetch_col};
             3'd1: begin
                 fg_code_nxt   <= fgvram_rD;
                 prom_lut_addr <= fgvram_rD[7:3];
@@ -749,7 +799,7 @@ reg [7:0] x_lo_lat;
 reg       x_hi_lat;
 reg [4:0] color_lat;
 reg [8:0] sy_full;
-reg [8:0] sx_full;
+reg signed [10:0] sx_full;   // SPR-X-WRAP-SIGNEXT-FIX-2026-07-01: was [8:0], see sx_calc below
 reg [3:0] y_in_tile;
 reg [9:0] code_lat;
 reg       flipx_lat, flipy_lat;
@@ -769,7 +819,19 @@ wire [7:0] eval_y    = eval_y9[7:0];
 wire [8:0] sy_pre  = 9'd257 - {1'b0, sy_y_raw};
 wire [8:0] sy_calc = (sy_pre > 9'd240) ? (sy_pre - 9'd256) : sy_pre;
 wire [8:0] sx_pre  = {x_hi_lat, x_lo_lat};
-wire [8:0] sx_calc = (sx_pre > 9'd320) ? (sx_pre - 9'd512) : sx_pre;
+// SPR-X-WRAP-SIGNEXT-FIX-2026-07-01: was `wire [8:0] sx_calc = (sx_pre>320)?(sx_pre-9'd512):sx_pre`.
+// Two compounding problems in a 9-bit field: (1) the literal 9'd512 doesn't fit in 9 bits and
+// truncates to 0, making the subtraction a no-op; (2) even setting that aside, the downstream
+// sign-extension ({{2{sx_full[8]}}, sx_full}) treats bit8==1 as "negative" — but sx_pre in
+// [256,320] also has bit8 set despite being on the "stay positive" side of the >320 threshold
+// (MAME kyugo.cpp:369-370 does this subtraction in a wide int, where no such bit-8 ambiguity
+// exists). Result: any sprite with raw X in [256,320] sign-extends to a large negative value
+// (e.g. 300 -> -212) and fails the on-screen check for its ENTIRE width — a hard, consistent
+// vanish at X=256, well short of the real 288px edge, exactly the reported symptom. Fix: do
+// the subtraction in a properly wide (11-bit) signed field so 256..320 stays correctly
+// positive and only 321..511 goes negative.
+wire signed [10:0] sx_calc = (sx_pre > 9'd320) ? ($signed({2'd0, sx_pre}) - 11'sd512)
+                                                : $signed({2'd0, sx_pre});
 
 // Row hit (in SS_FR0): diff = eval_y - sy_full (9-bit two's complement); hit if diff[8:8]=0 (positive)
 wire [8:0] hit_diff = {1'b0, eval_y} - sy_full;
@@ -797,7 +859,10 @@ wire       pix_p2     = byte2[bit_idx];
 wire [2:0] spr_pix    = {pix_p0, pix_p1, pix_p2};
 wire [7:0] spr_pal_idx = {color_lat[4:0], spr_pix[2:0]};
 
-wire signed [10:0] sx_signed       = {{2{sx_full[8]}}, sx_full};
+// SPR-X-WRAP-SIGNEXT-FIX-2026-07-01: sx_full is already correctly signed+wide (see sx_calc
+// above) — no re-extension needed here, was the bug (re-deriving sign from bit8 of a
+// too-narrow field).
+wire signed [10:0] sx_signed       = sx_full;
 wire signed [10:0] screen_x_signed = sx_signed + $signed({7'd0, px_idx});
 wire               screen_x_in_range = (screen_x_signed >= 11'sd0) && (screen_x_signed < 11'sd288);
 
