@@ -600,22 +600,15 @@ wire [2:0] bg_fy  = bg_world_y[2:0];
 // transform. Does NOT address the separate missing-HUD-icon symptom at the same
 // x-position (sprite/line-buffer swap logic resets at the same base_h_cnt==0 boundary,
 // Kyugo_CPU.sv:707-818, but via a different mechanism — untouched here).
-// WINDOW-WIDEN-FIX-2026-07-01: was `base_h_cnt >= 9'd388` (an 8-tick window). Bug found by
-// hand-tracing: the trigger this window relies on (bg_fx==0) doesn't always land at the
-// START of an 8-tick span — WHERE it lands within any 8 consecutive ticks depends on
-// scroll_x_full's low bits, which change continuously during scrolling. If bg_fx==0 lands
-// late in the window (close to tick 395), the 7-tick fetch+promote sequence spills PAST
-// the wrap into the new line's first few active pixels, leaving stale data visible for
-// however many pixels it overran by — and since scroll changes every frame during motion,
-// the overrun amount changes every frame too, matching the reported "worse when in
-// motion, same [not good] in stills" (a frozen scroll value gives a consistent, but not
-// necessarily complete, result). Worked the worst case: for ALL 8 possible scroll-phase
-// offsets, a window of 16 ticks (380..395) is guaranteed to contain at least one COMPLETE
-// fx 0-7 cycle that finishes at or before the wrap, regardless of phase. Widened from 8 to
-// 16 ticks. (Two-cycles-when-phase-is-early is harmless — bg_fetch_row/bg_fetch_col are
-// constant "column 0 of next row" throughout the whole window, so a redundant earlier
-// completion just gets safely overwritten by the correct later one.)
-wire bg_row_lookahead = (base_h_cnt >= 9'd380);   // last 16 ticks of blanking (380..395)
+// DETERMINISTIC-LOOKAHEAD-FIX-2026-07-01 (v3, replaces WINDOW-SHIFT-FIX/WINDOW-WIDEN-FIX):
+// both prior attempts tried to find the right scroll-phase-relative WINDOW for a fetch
+// still sequenced by bg_fx (which drifts against base_h_cnt depending on scroll) — shift
+// made it worse, widen was better but incomplete. The actual fix: stop sequencing the
+// lookahead fetch by bg_fx at all. It's now driven directly by base_h_cnt (see the
+// `case (base_h_cnt)` block below), landing on the exact same 4 fixed ticks every single
+// line regardless of scroll — deterministic, and pinned to promote at the latest possible
+// tick (395) for maximum freshness. This range just needs to cover that fixed sequence.
+wire bg_row_lookahead = (base_h_cnt >= 9'd388);   // covers the deterministic 388..395 sequence
 
 wire [8:0] v_cnt_next      = (v_cnt == 9'd259) ? 9'd0 : (v_cnt + 9'd1);
 wire [8:0] bg_sy_next      = flip_screen ? (9'd239 - v_cnt_next) : v_cnt_next;
@@ -657,44 +650,83 @@ reg  [7:0] bg_p0_lat, bg_p1_lat, bg_p2_lat;
 //   fx=1: bgvram_rD / bgattr_rD valid → latch code, color, flip bits, fy_eff; drive plane ROM addrs
 //   fx=2: bg0_D / bg1_D / bg2_D valid → latch into _nxt
 //   fx=7: promote _nxt → _lat (becomes the displayed tile starting next fx=0)
+// DETERMINISTIC-LOOKAHEAD-FIX-2026-07-01: user tried the window-shift fix and reported it
+// got WORSE (leftmost columns "changing faster" during scroll) — the opposite of the
+// window-widen attempt, which was better but still ~1 frame stale. Direction of the effect
+// says fetching EARLIER (more safety margin before the wrap) makes staleness worse, and
+// fetching LATER (closer to the actual display moment) makes it better — i.e. freshness,
+// not spillover-safety margin, is what actually matters here. So: stop routing the
+// lookahead through bg_fx (whose timing within the window depends on scroll phase, which
+// is exactly the "sometimes early, sometimes late" behavior that caused the inconsistent
+// results) and instead drive it from base_h_cnt DIRECTLY — deterministic, always the same
+// ticks every line regardless of scroll, and pinned to complete (promote) at the LATEST
+// possible tick, 395, one cycle before the wrap. This also fully replaces the old
+// window-shift/widen mechanism; only one fetch path is active at a time (lookahead XOR
+// normal), so there's no ambiguity or redundant-cycle risk to reason about anymore.
 always_ff @(posedge clk_49m) begin
     if (cen_pix) begin
-        case (bg_fx)
-            3'd0: begin
-                // BG-ROWWRAP-LOOKAHEAD-FIX-2026-07-01: was {bg_row, bg_col + 6'd1}
-                // unconditionally — see the wire declarations above for why this needs
-                // to target the NEXT row's column 0 during the last 8 blanking ticks.
-                bgvram_raddr <= {bg_fetch_row, bg_fetch_col};
-                bgattr_raddr <= {bg_fetch_row, bg_fetch_col};
-            end
-            3'd1: begin
-                bg_code_nxt      <= {bgattr_rD[1:0], bgvram_rD};
-                bg_color_nxt     <= {bgpalbank, bgattr_rD[7:4]};
-                // BG-FLIP-SWAP-FIX-2026-06-12: MAME get_bg_tile_info uses TILE_FLIPYX((attr&0x0c)>>2) ⇒
-                // flipX = attr BIT 2, flipY = attr BIT 3. We had them swapped (bit3/bit2 = the SPRITE
-                // convention), mirroring BG tiles on the wrong axis. (FG has no per-tile flip — correct.)
-                bg_fx_invert_nxt <= bgattr_rD[2] ^ flip_screen;            // flipX = attr bit 2 (MAME)
-                // FINE-Y-LOOKAHEAD-FIX-2026-07-01: was bg_fy (unconditional) in all 4 lines below —
-                // see the bg_fetch_fy wire declaration above for why this needs the lookahead-aware value.
-                bg_fy_eff        <= bg_fetch_fy ^ {3{bgattr_rD[3] ^ flip_screen}}; // flipY = attr bit 3 (MAME)
-                bg0_addr <= {1'b0, {bgattr_rD[1:0], bgvram_rD}, (bg_fetch_fy ^ {3{bgattr_rD[3] ^ flip_screen}})};
-                bg1_addr <= {1'b0, {bgattr_rD[1:0], bgvram_rD}, (bg_fetch_fy ^ {3{bgattr_rD[3] ^ flip_screen}})};
-                bg2_addr <= {1'b0, {bgattr_rD[1:0], bgvram_rD}, (bg_fetch_fy ^ {3{bgattr_rD[3] ^ flip_screen}})};
-            end
-            3'd2: begin
-                bg_p0_nxt <= bg0_D;
-                bg_p1_nxt <= bg1_D;
-                bg_p2_nxt <= bg2_D;
-            end
-            3'd7: begin
-                bg_color_lat     <= bg_color_nxt;
-                bg_fx_invert_lat <= bg_fx_invert_nxt;
-                bg_p0_lat        <= bg_p0_nxt;
-                bg_p1_lat        <= bg_p1_nxt;
-                bg_p2_lat        <= bg_p2_nxt;
-            end
-            default: ; // idle
-        endcase
+        if (bg_row_lookahead) begin
+            case (base_h_cnt)
+                9'd388: begin
+                    bgvram_raddr <= {bg_fetch_row, bg_fetch_col};
+                    bgattr_raddr <= {bg_fetch_row, bg_fetch_col};
+                end
+                9'd389: begin
+                    bg_code_nxt      <= {bgattr_rD[1:0], bgvram_rD};
+                    bg_color_nxt     <= {bgpalbank, bgattr_rD[7:4]};
+                    bg_fx_invert_nxt <= bgattr_rD[2] ^ flip_screen;
+                    bg_fy_eff        <= bg_fetch_fy ^ {3{bgattr_rD[3] ^ flip_screen}};
+                    bg0_addr <= {1'b0, {bgattr_rD[1:0], bgvram_rD}, (bg_fetch_fy ^ {3{bgattr_rD[3] ^ flip_screen}})};
+                    bg1_addr <= {1'b0, {bgattr_rD[1:0], bgvram_rD}, (bg_fetch_fy ^ {3{bgattr_rD[3] ^ flip_screen}})};
+                    bg2_addr <= {1'b0, {bgattr_rD[1:0], bgvram_rD}, (bg_fetch_fy ^ {3{bgattr_rD[3] ^ flip_screen}})};
+                end
+                9'd390: begin
+                    bg_p0_nxt <= bg0_D;
+                    bg_p1_nxt <= bg1_D;
+                    bg_p2_nxt <= bg2_D;
+                end
+                9'd395: begin
+                    bg_color_lat     <= bg_color_nxt;
+                    bg_fx_invert_lat <= bg_fx_invert_nxt;
+                    bg_p0_lat        <= bg_p0_nxt;
+                    bg_p1_lat        <= bg_p1_nxt;
+                    bg_p2_lat        <= bg_p2_nxt;
+                end
+                default: ; // idle (391-394): deliberate slack, matches the normal path's spare cycles
+            endcase
+        end else begin
+            case (bg_fx)
+                3'd0: begin
+                    bgvram_raddr <= {bg_fetch_row, bg_fetch_col};
+                    bgattr_raddr <= {bg_fetch_row, bg_fetch_col};
+                end
+                3'd1: begin
+                    bg_code_nxt      <= {bgattr_rD[1:0], bgvram_rD};
+                    bg_color_nxt     <= {bgpalbank, bgattr_rD[7:4]};
+                    // BG-FLIP-SWAP-FIX-2026-06-12: MAME get_bg_tile_info uses TILE_FLIPYX((attr&0x0c)>>2) ⇒
+                    // flipX = attr BIT 2, flipY = attr BIT 3. We had them swapped (bit3/bit2 = the SPRITE
+                    // convention), mirroring BG tiles on the wrong axis. (FG has no per-tile flip — correct.)
+                    bg_fx_invert_nxt <= bgattr_rD[2] ^ flip_screen;            // flipX = attr bit 2 (MAME)
+                    bg_fy_eff        <= bg_fetch_fy ^ {3{bgattr_rD[3] ^ flip_screen}}; // flipY = attr bit 3 (MAME)
+                    bg0_addr <= {1'b0, {bgattr_rD[1:0], bgvram_rD}, (bg_fetch_fy ^ {3{bgattr_rD[3] ^ flip_screen}})};
+                    bg1_addr <= {1'b0, {bgattr_rD[1:0], bgvram_rD}, (bg_fetch_fy ^ {3{bgattr_rD[3] ^ flip_screen}})};
+                    bg2_addr <= {1'b0, {bgattr_rD[1:0], bgvram_rD}, (bg_fetch_fy ^ {3{bgattr_rD[3] ^ flip_screen}})};
+                end
+                3'd2: begin
+                    bg_p0_nxt <= bg0_D;
+                    bg_p1_nxt <= bg1_D;
+                    bg_p2_nxt <= bg2_D;
+                end
+                3'd7: begin
+                    bg_color_lat     <= bg_color_nxt;
+                    bg_fx_invert_lat <= bg_fx_invert_nxt;
+                    bg_p0_lat        <= bg_p0_nxt;
+                    bg_p1_lat        <= bg_p1_nxt;
+                    bg_p2_lat        <= bg_p2_nxt;
+                end
+                default: ; // idle
+            endcase
+        end
     end
 end
 
@@ -752,30 +784,57 @@ reg  [7:0] fg_byte_l_lat, fg_byte_r_lat;
 //   fx=7: promote _nxt → _lat
 always_ff @(posedge clk_49m) begin
     if (cen_pix) begin
-        case (fg_fx)
-            // FG-ROWWRAP-LOOKAHEAD-FIX-2026-07-01: was {fg_row, fg_col + 6'd1} unconditionally.
-            3'd0: fgvram_raddr <= {fg_fetch_row, fg_fetch_col};
-            3'd1: begin
-                fg_code_nxt   <= fgvram_rD;
-                prom_lut_addr <= fgvram_rD[7:3];
-            end
-            3'd2: begin
-                fg_color_nxt <= {prom_lut_D[4:0], fgcolor};   // full 5-bit colour code from the LUT + fgcolor bank bit
-                // FINE-Y-LOOKAHEAD-FIX-2026-07-01: was fg_fy (unconditional) in both lines below.
-                fgtile_addr  <= {fg_code_nxt, 1'b0, fg_fetch_fy};   // left chunk byte at offset y
-            end
-            3'd3: begin
-                fg_byte_l_nxt <= fgtile_D;
-                fgtile_addr   <= {fg_code_nxt, 1'b1, fg_fetch_fy};   // right chunk byte at offset y+8
-            end
-            3'd4: fg_byte_r_nxt <= fgtile_D;
-            3'd7: begin
-                fg_color_lat  <= fg_color_nxt;
-                fg_byte_l_lat <= fg_byte_l_nxt;
-                fg_byte_r_lat <= fg_byte_r_nxt;
-            end
-            default: ;
-        endcase
+        // DETERMINISTIC-LOOKAHEAD-FIX-2026-07-01: same reasoning as the BG pipeline above —
+        // sequencing this by base_h_cnt directly (fixed ticks, every line) instead of fg_fx
+        // (scroll-phase-dependent timing) during the lookahead window, promoting at the
+        // latest possible tick (395) for maximum freshness.
+        if (bg_row_lookahead) begin
+            case (base_h_cnt)
+                9'd388: fgvram_raddr <= {fg_fetch_row, fg_fetch_col};
+                9'd389: begin
+                    fg_code_nxt   <= fgvram_rD;
+                    prom_lut_addr <= fgvram_rD[7:3];
+                end
+                9'd390: begin
+                    fg_color_nxt <= {prom_lut_D[4:0], fgcolor};
+                    fgtile_addr  <= {fg_code_nxt, 1'b0, fg_fetch_fy};
+                end
+                9'd391: begin
+                    fg_byte_l_nxt <= fgtile_D;
+                    fgtile_addr   <= {fg_code_nxt, 1'b1, fg_fetch_fy};
+                end
+                9'd392: fg_byte_r_nxt <= fgtile_D;
+                9'd395: begin
+                    fg_color_lat  <= fg_color_nxt;
+                    fg_byte_l_lat <= fg_byte_l_nxt;
+                    fg_byte_r_lat <= fg_byte_r_nxt;
+                end
+                default: ; // idle (393-394): deliberate slack
+            endcase
+        end else begin
+            case (fg_fx)
+                3'd0: fgvram_raddr <= {fg_fetch_row, fg_fetch_col};
+                3'd1: begin
+                    fg_code_nxt   <= fgvram_rD;
+                    prom_lut_addr <= fgvram_rD[7:3];
+                end
+                3'd2: begin
+                    fg_color_nxt <= {prom_lut_D[4:0], fgcolor};   // full 5-bit colour code from the LUT + fgcolor bank bit
+                    fgtile_addr  <= {fg_code_nxt, 1'b0, fg_fetch_fy};   // left chunk byte at offset y
+                end
+                3'd3: begin
+                    fg_byte_l_nxt <= fgtile_D;
+                    fgtile_addr   <= {fg_code_nxt, 1'b1, fg_fetch_fy};   // right chunk byte at offset y+8
+                end
+                3'd4: fg_byte_r_nxt <= fgtile_D;
+                3'd7: begin
+                    fg_color_lat  <= fg_color_nxt;
+                    fg_byte_l_lat <= fg_byte_l_nxt;
+                    fg_byte_r_lat <= fg_byte_r_nxt;
+                end
+                default: ;
+            endcase
+        end
     end
 end
 
