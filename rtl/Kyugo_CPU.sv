@@ -605,10 +605,13 @@ wire [2:0] bg_fy  = bg_world_y[2:0];
 // still sequenced by bg_fx (which drifts against base_h_cnt depending on scroll) — shift
 // made it worse, widen was better but incomplete. The actual fix: stop sequencing the
 // lookahead fetch by bg_fx at all. It's now driven directly by base_h_cnt (see the
-// `case (base_h_cnt)` block below), landing on the exact same 4 fixed ticks every single
-// line regardless of scroll — deterministic, and pinned to promote at the latest possible
-// tick (395) for maximum freshness. This range just needs to cover that fixed sequence.
-wire bg_row_lookahead = (base_h_cnt >= 9'd388);   // covers the deterministic 388..395 sequence
+// `case (base_h_cnt)` blocks below, BG and FG), deterministic regardless of scroll, pinned
+// to promote at the latest possible tick (395). TIGHTEN-LOOKAHEAD-FIX then BISECT-LOOKAHEAD-
+// FIX-2026-07-01: fully-compressed (zero idle) tested worse than the original padded version
+// — not monotonic, there's a sweet spot, not an extreme. Currently bisecting: BG starts at
+// 390 (2-tick idle before promote), FG starts at 389 (1-tick idle). This range covers FG's
+// (earlier) start; BG's case statement simply idles (`default`) on 389.
+wire bg_row_lookahead = (base_h_cnt >= 9'd389);   // covers both sequences (FG starts earliest, at 389)
 
 wire [8:0] v_cnt_next      = (v_cnt == 9'd259) ? 9'd0 : (v_cnt + 9'd1);
 wire [8:0] bg_sy_next      = flip_screen ? (9'd239 - v_cnt_next) : v_cnt_next;
@@ -666,12 +669,18 @@ reg  [7:0] bg_p0_lat, bg_p1_lat, bg_p2_lat;
 always_ff @(posedge clk_49m) begin
     if (cen_pix) begin
         if (bg_row_lookahead) begin
+            // BISECT-LOOKAHEAD-FIX-2026-07-01: two data points now — 388/389/390/(4-tick idle)/395
+            // was "really really close" (best so far); 392/393/394/395 (0-tick idle, fully
+            // compressed) was "too far, worse". Not monotonic — there's a sweet spot somewhere
+            // between "some padding" and "none", not at either extreme. Splitting the
+            // difference: 390/391/392/(2-tick idle)/395, to bracket it further before assuming
+            // either endpoint is optimal.
             case (base_h_cnt)
-                9'd388: begin
+                9'd390: begin
                     bgvram_raddr <= {bg_fetch_row, bg_fetch_col};
                     bgattr_raddr <= {bg_fetch_row, bg_fetch_col};
                 end
-                9'd389: begin
+                9'd391: begin
                     bg_code_nxt      <= {bgattr_rD[1:0], bgvram_rD};
                     bg_color_nxt     <= {bgpalbank, bgattr_rD[7:4]};
                     bg_fx_invert_nxt <= bgattr_rD[2] ^ flip_screen;
@@ -680,7 +689,7 @@ always_ff @(posedge clk_49m) begin
                     bg1_addr <= {1'b0, {bgattr_rD[1:0], bgvram_rD}, (bg_fetch_fy ^ {3{bgattr_rD[3] ^ flip_screen}})};
                     bg2_addr <= {1'b0, {bgattr_rD[1:0], bgvram_rD}, (bg_fetch_fy ^ {3{bgattr_rD[3] ^ flip_screen}})};
                 end
-                9'd390: begin
+                9'd392: begin
                     bg_p0_nxt <= bg0_D;
                     bg_p1_nxt <= bg1_D;
                     bg_p2_nxt <= bg2_D;
@@ -692,7 +701,7 @@ always_ff @(posedge clk_49m) begin
                     bg_p1_lat        <= bg_p1_nxt;
                     bg_p2_lat        <= bg_p2_nxt;
                 end
-                default: ; // idle (391-394): deliberate slack, matches the normal path's spare cycles
+                default: ; // idle (388-391): no longer used, freed up by tightening
             endcase
         end else begin
             case (bg_fx)
@@ -789,27 +798,32 @@ always_ff @(posedge clk_49m) begin
         // (scroll-phase-dependent timing) during the lookahead window, promoting at the
         // latest possible tick (395) for maximum freshness.
         if (bg_row_lookahead) begin
+            // BISECT-LOOKAHEAD-FIX-2026-07-01: BG's 4-tick-idle version tested best so far, 0-tick
+            // tested worse — splitting the difference. FG bracketed proportionally: was
+            // 388/389/390/391/392/(2-tick idle)/395 (best-so-far analog), tightened attempt was
+            // 390/391/392/393/394/395 (0-tick, analog of "too far"); middle here is a 1-tick gap:
+            // 389/390/391/392/393/(1-tick idle)/395.
             case (base_h_cnt)
-                9'd388: fgvram_raddr <= {fg_fetch_row, fg_fetch_col};
-                9'd389: begin
+                9'd389: fgvram_raddr <= {fg_fetch_row, fg_fetch_col};
+                9'd390: begin
                     fg_code_nxt   <= fgvram_rD;
                     prom_lut_addr <= fgvram_rD[7:3];
                 end
-                9'd390: begin
+                9'd391: begin
                     fg_color_nxt <= {prom_lut_D[4:0], fgcolor};
                     fgtile_addr  <= {fg_code_nxt, 1'b0, fg_fetch_fy};
                 end
-                9'd391: begin
+                9'd392: begin
                     fg_byte_l_nxt <= fgtile_D;
                     fgtile_addr   <= {fg_code_nxt, 1'b1, fg_fetch_fy};
                 end
-                9'd392: fg_byte_r_nxt <= fgtile_D;
+                9'd393: fg_byte_r_nxt <= fgtile_D;
                 9'd395: begin
                     fg_color_lat  <= fg_color_nxt;
                     fg_byte_l_lat <= fg_byte_l_nxt;
                     fg_byte_r_lat <= fg_byte_r_nxt;
                 end
-                default: ; // idle (393-394): deliberate slack
+                default: ; // idle (388-389): no longer used, freed up by tightening
             endcase
         end else begin
             case (fg_fx)
