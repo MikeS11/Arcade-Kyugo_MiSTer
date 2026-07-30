@@ -551,8 +551,19 @@ arcade_video #(288, 24) arcade_video
 // Assemble player control bytes for Kyugo (active HIGH)
 // p1/p2: {2'b00, btn2, btn1, right, left, down, up}
 // sys:   {2'b00, service, start2, start1, 1'b0, coin2, coin1}
-wire [7:0] p1_controls  = {2'b00, m_fire1b, m_fire1, m_right1, m_left1, rot_flip ? m_up1 : m_down1, rot_flip ? m_down1 : m_up1};
-wire [7:0] p2_controls  = {2'b00, m_fire2b, m_fire2, m_right2, m_left2, rot_flip ? m_up2 : m_down2, rot_flip ? m_down2 : m_up2};
+// CTRL-ROT-AXIS-FIX-2026-07-29: the bit names above are in the GAME's frame, which on the ROT90 sets is
+// 90 degrees from the player's frame — so the `right/left` bits drive PERCEIVED up/down and the `down/up`
+// bits drive PERCEIVED left/right. Proven on HW: swapping bits 3/2 changed perceived up/down.
+// The old `rot_flip ? m_up : m_down` conditional on bits 1/0 was therefore inverting perceived LEFT/RIGHT
+// on the two rot_flip=1 sets (Repulse, SRD Mission) — the reported bug. It was almost certainly a
+// workaround for the Gyrodine orientation bug fixed earlier today; with orientation correct, no per-set
+// control swap is needed at all. Now matches the documented bit order with no special-casing.
+// Bit-identical for all four rot_flip=0 sets (Gyrodine/Flashgal/Legend/Airwolf), which tested correct.
+// DIAG-REVERT-2026-07-29: originals below
+// wire [7:0] p1_controls  = {2'b00, m_fire1b, m_fire1, m_right1, m_left1, rot_flip ? m_up1 : m_down1, rot_flip ? m_down1 : m_up1};
+// wire [7:0] p2_controls  = {2'b00, m_fire2b, m_fire2, m_right2, m_left2, rot_flip ? m_up2 : m_down2, rot_flip ? m_down2 : m_up2};
+wire [7:0] p1_controls  = {2'b00, m_fire1b, m_fire1, m_right1, m_left1, m_down1, m_up1};
+wire [7:0] p2_controls  = {2'b00, m_fire2b, m_fire2, m_right2, m_left2, m_down2, m_up2};
 wire [7:0] sys_controls = {2'b00, btn_service, m_start2, m_start1, 1'b0, m_coin2, m_coin1};
 
 // Instantiate Kyugo top-level module

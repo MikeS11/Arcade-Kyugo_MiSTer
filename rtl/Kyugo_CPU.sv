@@ -295,6 +295,11 @@ always_ff @(posedge clk_49m) begin
 			wdog_frames <= 9'd0;
 		end else if (cs_watchdog & ~cpu1_WR_n) begin
 			wdog_frames <= 9'd0;                    // kicked
+		end else if (pause) begin
+			// WDOG-PAUSE-GATE-FIX-2026-07-29: pause freezes both Z80s (:140/:317) but NOT the video
+			// counters, so vblk kept ticking with no CPU alive to kick $E000 -> reset at ~2s in the
+			// OSD. Clear rather than freeze, so a nearly-expired count can't bite just after resume.
+			wdog_frames <= 9'd0;
 		end else if (vblk & ~wdog_vblk_d & (variant_sel == VAR_GYRO)) begin
 			if (wdog_frames >= WDOG_TIMEOUT) begin
 				wdog_pulse  <= 10'h3FF;             // FIRE: ~1023 clk reset pulse (many cen_cpu)
@@ -1093,8 +1098,19 @@ wire [9:0] code_now  = {spram1_rD[0], spram1_rD[1], fgvram_spr_rD};
 // DIAG-REVERT-2026-07-29: originals below
 // wire       flipx_now = spram1_rD[3];
 // wire       flipy_now = spram1_rD[2];
-wire       flipx_now = spram1_rD[3] ^ flip_screen;
-wire       flipy_now = spram1_rD[2] ^ flip_screen;
+// SPR-FLIPX-RESTORE-FIX-2026-07-29: `SPR-X-UNMIRROR` above cancelled the rotation's X mirror by
+// writing `287 - (sx + px_idx)`, which cancelled the POSITION mirror (wanted — MAME leaves sx alone)
+// but ALSO cancelled the per-CELL mirror on that axis (not wanted — MAME inverts flipx when flipped,
+// kyugo.cpp:391-395). Net effect: sprites landed in the right place with each 16x16 cell mirrored the
+// wrong way along render X = the displayed VERTICAL. Symptom (HW 2026-07-29): correct position, but
+// the shadow upside down and the helicopter "kinda inside out". Restore the cell mirror via flipx.
+// flipy needs NO XOR here: the rotation's Y mirror already supplies MAME's flipy inversion, its sy
+// mirror and its stacking reversal all at once. Gated on flip_req ⇒ other 7 sets bit-identical.
+// DIAG-REVERT-2026-07-29: originals below
+// wire       flipx_now = spram1_rD[3] ^ flip_screen;
+// wire       flipy_now = spram1_rD[2] ^ flip_screen;
+wire       flipx_now = spram1_rD[3] ^ flip_req;
+wire       flipy_now = spram1_rD[2];
 wire [3:0] y_eff_now = flipy_now ? (4'd15 - y_in_tile) : y_in_tile;
 wire [3:0] y_eff_lat = flipy_lat ? (4'd15 - y_in_tile) : y_in_tile;
 
@@ -1183,7 +1199,14 @@ always_ff @(posedge clk_49m) begin
                     // is what the reference does; replicating it exactly, revisit only if HW disagrees.
                     // DIAG-REVERT-2026-07-29: original below
                     // sy_full   <= sy_calc;
-                    sy_full   <= flip_screen ? (9'd240 - sy_calc) : sy_calc;
+                    // SPR-Y-OFFSET-FIX-2026-07-29: MEASURED offset vs a matched MAME frame, two rounds:
+                    // -17 left it 1px short, -16 is dead-on (HW-confirmed). Derivation predicted an exact
+                    // match at -17 (MAME `240 - raw` vs ours `240 - raw`), so the residual 1px is a real gap
+                    // in that model — most likely the sprite line-buffer's one-line pipeline or the exact
+                    // mirror constant inside screen_rotate. MEASURED value wins; don't "correct" it back to
+                    // 17 from the algebra. Gated on flip_req: only the rotation-supplied-180 set needs it.
+                    sy_full   <= flip_screen ? (9'd240 - sy_calc)
+                                             : (flip_req ? (sy_calc - 9'd16) : sy_calc);
                     sx_full   <= sx_calc;
                     spr_st    <= SS_FR0;
                 end
