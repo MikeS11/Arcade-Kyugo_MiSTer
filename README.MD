@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="Useful Information/Vastar.png" width="800">
+  <img src="Useful Information/Gyrodine.png" width="800">
 </p>
 
 <h1 align="center">Kyugo Hardware FPGA Core</h1>
