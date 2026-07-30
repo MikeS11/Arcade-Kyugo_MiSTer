@@ -1114,8 +1114,20 @@ wire [7:0] spr_pal_idx = {color_lat[4:0], spr_pix[2:0]};
 // SPR-X-WRAP-SIGNEXT-FIX-2026-07-01: sx_full is already correctly signed+wide (see sx_calc
 // above) — no re-extension needed here, was the bug (re-deriving sign from bit8 of a
 // too-narrow field).
-wire signed [10:0] sx_signed       = sx_full;
-wire signed [10:0] screen_x_signed = sx_signed + $signed({7'd0, px_idx});
+wire signed [10:0] sx_signed    = sx_full;
+wire signed [10:0] screen_x_raw = sx_signed + $signed({7'd0, px_idx});
+// SPR-X-UNMIRROR-FIX-2026-07-29: MAME's sprite flip is ASYMMETRIC — it mirrors sy (240-sy),
+// inverts flipx/flipy and reverses stacking, but passes sx through UNCHANGED (kyugo.cpp:401).
+// screen_rotate mirrors BOTH render axes, which is correct for BG (MAME's tilemap flip also does
+// both) but over-mirrors sprites on X. Render X is the displayed VERTICAL on ROT90, so the symptom
+// was inverted sprite height: helicopter at the top instead of the bottom, enemies entering from
+// the bottom instead of the top (HW 2026-07-29). Pre-mirroring here cancels the rotation's X
+// mirror, leaving sprites unmirrored in display space, matching MAME. Mirroring preserves the
+// in-range test (out-of-range values stay out on both sides). Gated on flip_req ⇒ other 7 sets
+// bit-identical. Cell-internal orientation and stacking direction need no change: the rotation's
+// both-axis mirror already matches MAME inverting both flipx and flipy, and our +16y stacking
+// plus the rotation lands the same as MAME's -16y.
+wire signed [10:0] screen_x_signed = flip_req ? (11'sd287 - screen_x_raw) : screen_x_raw;
 wire               screen_x_in_range = (screen_x_signed >= 11'sd0) && (screen_x_signed < 11'sd288);
 
 always_ff @(posedge clk_49m) begin
