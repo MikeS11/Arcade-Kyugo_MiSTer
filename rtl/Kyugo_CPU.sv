@@ -630,8 +630,12 @@ wire [8:0] scroll_x_full = {scroll_x_hi, scroll_x_lo};
 // the portrait screen is this RENDER-space scroll_x (render is 288x224 landscape pre-rotation).
 // Gated on mainlatch[1] = the game's own flip request, so the 7 sets that never assert it are
 // bit-identical. Modular arithmetic: the subtraction wraps correctly mod 512 in the low 9 bits.
+// SCROLLDX-FLIP-FIX-2026-07-29: `set_scrolldx(-32, 288+32)` (kyugo.cpp:271) — 2nd arg is the
+// FLIPPED-mode dx. World offset = -dx, so flipped needs -320 == +192 (mod 512), not +32. Being off
+// by 288 (one screen width) put the window outside the tilemap region the game writes, so BG only
+// covered part of the screen. HW 2026-07-29: scroll direction correct, BG started ~halfway.
 wire flip_req = mainlatch[1];   // game asked for flip; honoured via screen_rotate, not in-render
-wire [9:0] bg_world_x_pre = flip_req ? ({1'b0, bg_sx} - {1'b0, scroll_x_full} + 10'd32)
+wire [9:0] bg_world_x_pre = flip_req ? ({1'b0, bg_sx} - {1'b0, scroll_x_full} + 10'd192)
                                      : ({1'b0, bg_sx} + {1'b0, scroll_x_full} + 10'd32);
 wire [8:0] bg_world_x = bg_world_x_pre[8:0];   // wraps mod 512 (matches 64x8 = 512 BG width)
 wire [8:0] bg_world_y = bg_sy + {1'b0, scroll_y_r};
@@ -686,7 +690,7 @@ wire [8:0] bg_sx_zero           = flip_screen ? 9'd287 : 9'd0;
 // SCROLLX-NEGATE-FIX-2026-07-29 (cont): must mirror bg_world_x_pre exactly — this is the lookahead's
 // column-0 fetch, and if its scroll sign differs from the main path, column 0 disagrees with the rest
 // of the line. DIAG-REVERT-2026-07-29: original was the unconditional `+ scroll_x_full` form.
-wire [9:0] bg_world_x_zero_pre  = flip_req ? ({1'b0, bg_sx_zero} - {1'b0, scroll_x_full} + 10'd32)
+wire [9:0] bg_world_x_zero_pre  = flip_req ? ({1'b0, bg_sx_zero} - {1'b0, scroll_x_full} + 10'd192)
                                            : ({1'b0, bg_sx_zero} + {1'b0, scroll_x_full} + 10'd32);
 wire [8:0] bg_world_x_zero      = bg_world_x_zero_pre[8:0];
 wire [5:0] bg_col_zero          = bg_world_x_zero[8:3];
