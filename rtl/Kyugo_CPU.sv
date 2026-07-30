@@ -617,7 +617,22 @@ wire [8:0] bg_sy = flip_screen ? (9'd255 - v_cnt)      : v_cnt;
 
 // World coords (BG has set_scrolldx(-32) → +32 in world space when not flipped)
 wire [8:0] scroll_x_full = {scroll_x_hi, scroll_x_lo};
-wire [9:0] bg_world_x_pre = {1'b0, bg_sx} + {1'b0, scroll_x_full} + 10'd32;
+
+// SCROLLX-NEGATE-FIX-2026-07-29: MAME negates BG scroll_x whenever the game requests flip
+// (kyugo.cpp:409-412 — `set_scrollx(0, -(lo + hi*256))` if flip_screen(), positive otherwise);
+// scroll_y is NOT negated (:414). FLIP-PATH-BYPASS forces the RENDER's flip_screen to 0 and lets
+// screen_rotate supply the 180 degrees, which is right for the coordinate mirror — but it also
+// dropped this scroll_x negation, which is a genuine part of flip semantics and NOT something the
+// rotation can supply (rotation transforms the finished frame; it cannot change which direction a
+// scroll counter walks the tilemap). Symptom: Gyrodine's land/sea scrolled smoothly but BACKWARDS
+// (HW 2026-07-29) while SRD Mission was perfect — SRD never asserts the flip bit, so it never
+// wanted the negation. Note Gyrodine is ROT90, so the scroll the player sees running vertically up
+// the portrait screen is this RENDER-space scroll_x (render is 288x224 landscape pre-rotation).
+// Gated on mainlatch[1] = the game's own flip request, so the 7 sets that never assert it are
+// bit-identical. Modular arithmetic: the subtraction wraps correctly mod 512 in the low 9 bits.
+wire flip_req = mainlatch[1];   // game asked for flip; honoured via screen_rotate, not in-render
+wire [9:0] bg_world_x_pre = flip_req ? ({1'b0, bg_sx} - {1'b0, scroll_x_full} + 10'd32)
+                                     : ({1'b0, bg_sx} + {1'b0, scroll_x_full} + 10'd32);
 wire [8:0] bg_world_x = bg_world_x_pre[8:0];   // wraps mod 512 (matches 64x8 = 512 BG width)
 wire [8:0] bg_world_y = bg_sy + {1'b0, scroll_y_r};
 
@@ -668,7 +683,11 @@ wire [8:0] bg_world_y_next = bg_sy_next + {1'b0, scroll_y_r};
 wire [4:0] bg_row_next     = bg_world_y_next[7:3];
 
 wire [8:0] bg_sx_zero           = flip_screen ? 9'd287 : 9'd0;
-wire [9:0] bg_world_x_zero_pre  = {1'b0, bg_sx_zero} + {1'b0, scroll_x_full} + 10'd32;
+// SCROLLX-NEGATE-FIX-2026-07-29 (cont): must mirror bg_world_x_pre exactly — this is the lookahead's
+// column-0 fetch, and if its scroll sign differs from the main path, column 0 disagrees with the rest
+// of the line. DIAG-REVERT-2026-07-29: original was the unconditional `+ scroll_x_full` form.
+wire [9:0] bg_world_x_zero_pre  = flip_req ? ({1'b0, bg_sx_zero} - {1'b0, scroll_x_full} + 10'd32)
+                                           : ({1'b0, bg_sx_zero} + {1'b0, scroll_x_full} + 10'd32);
 wire [8:0] bg_world_x_zero      = bg_world_x_zero_pre[8:0];
 wire [5:0] bg_col_zero          = bg_world_x_zero[8:3];
 
