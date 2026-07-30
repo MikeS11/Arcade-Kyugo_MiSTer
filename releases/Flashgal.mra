@@ -27,8 +27,8 @@
 		<dip bits="6"        name="Cabinet"        ids="Upright,Cocktail"/>
 		<dip bits="7"        name="Freeze"         ids="On,Off"/>
 		<!-- DSW2 (AY1 port B) -->
-		<dip bits="8,9,10"   name="Coin A"         ids="Free Play,3C/2C,2C/1C,1C/6C,1C/4C,1C/3C,1C/2C,1C/1C"/>
-		<dip bits="11,12,13" name="Coin B"         ids="5C/1C,4C/1C,3C/1C,2C/1C,3C/4C,1C/3C,1C/2C,1C/1C"/>
+		<dip bits="8,10"     name="Coin A"         ids="Free Play,3C/2C,2C/1C,1C/6C,1C/4C,1C/3C,1C/2C,1C/1C"/>
+		<dip bits="11,13"    name="Coin B"         ids="5C/1C,4C/1C,3C/1C,2C/1C,3C/4C,1C/3C,1C/2C,1C/1C"/>
 	</switches>
 
 	<!-- Index 1: variant_sel[2:0] | rot_flip[3] | no_rotate[4]. Flashgal (Sega) runs the REPULSE

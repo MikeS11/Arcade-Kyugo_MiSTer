@@ -27,11 +27,11 @@
 		<dip bits="6"        name="Cabinet"        ids="Upright,Cocktail"/>
 		<dip bits="7"        name="Freeze"         ids="On,Off"/>
 		<!-- DSW2 -->
-		<dip bits="8,9,10"   name="Coin A"         ids="Free Play,3C/2C,2C/1C,1C/6C,1C/4C,1C/3C,1C/2C,1C/1C"/>
-		<dip bits="11,12,13" name="Coin B"         ids="5C/1C,4C/1C,3C/1C,2C/1C,3C/4C,1C/3C,1C/2C,1C/1C"/>
+		<dip bits="8,10"     name="Coin A"         ids="Free Play,3C/2C,2C/1C,1C/6C,1C/4C,1C/3C,1C/2C,1C/1C"/>
+		<dip bits="11,13"    name="Coin B"         ids="5C/1C,4C/1C,3C/1C,2C/1C,3C/4C,1C/3C,1C/2C,1C/1C"/>
 	</switches>
 
-	<!-- Index 1: byte = variant(3) | no_rotate(bit4). MAME: GAME(airwolf,...,srdmissn,...) -- Airwolf
+	<!-- Index 1: byte = variant(3) | no_rotate(bit4). MAME: GAME(airwolf,...,srdmissn,...). Airwolf
 	     reuses SRD Mission's machine config verbatim (same sub-RAM/input/AY address map), so
 	     variant = VAR_SRDMISSN = 3, already implemented in this core's RTL. ROT0/horizontal per MAME
 	     and the flight manual ("horizontally [X] mounted ... monitor") -> no_rotate. rot_flip left 0,
@@ -52,7 +52,7 @@
 		<!-- FG 4KB -->
 		<part crc="4df44ce9" name="f.4a"/>
 		<!-- BG planes 16KB each (8KB ROM + 8KB pad). MAME gfx2 load order is plane1,plane0,plane2
-		     (see comments in kyugo.cpp ROM_START(airwolf)) -- reordered here to plane0,plane1,plane2
+		     (see comments in kyugo.cpp ROM_START(airwolf)). Reordered here to plane0,plane1,plane2
 		     to match the renderer's convention, same fix SRD Mission needed (best guess; swap
 		     bg0/bg1 if BG colours look wrong). -->
 		<!-- BG plane 0 = 10h_13.bin -->
@@ -66,12 +66,12 @@
 		<part repeat="8192"> 00 </part>
 		<!-- Sprite plane 0 32KB. UNVERIFIED / first use on this core: MAME loads this via
 		     ROM_LOAD+ROM_CONTINUE that scrambles e.6a's four 8KB quarters into the region as
-		     [Q0,Q2,Q1,Q3] (kyugo.cpp ROM_START(airwolf) gfx3) -- unlike every other Kyugo game done
+		     [Q0,Q2,Q1,Q3] (kyugo.cpp ROM_START(airwolf) gfx3). Unlike every other Kyugo game done
 		     so far, which use flat unscrambled sprite ROMs. Un-scrambled here back to ascending
 		     region order by pulling the quarters out of source-file order (offset/length slices of
 		     the same 32KB file; crc is the whole-file crc each time, per mra-tools convention).
 		     If sprites render as garbled/interleaved noise, this 4-part reorder is the first
-		     suspect -- the offset/length part syntax itself is unverified against a local example. -->
+		     suspect; the offset/length part syntax itself is unverified against a local example. -->
 		<part crc="e8fbc7d2" name="e.6a" offset="0x0000" length="0x2000"/>
 		<part crc="e8fbc7d2" name="e.6a" offset="0x4000" length="0x2000"/>
 		<part crc="e8fbc7d2" name="e.6a" offset="0x2000" length="0x2000"/>
