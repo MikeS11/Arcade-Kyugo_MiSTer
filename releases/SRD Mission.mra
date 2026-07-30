@@ -31,8 +31,10 @@
 		<dip bits="11,12,13" name="Coin B"          ids="5C/1C,4C/1C,3C/1C,2C/1C,3C/4C,1C/3C,1C/2C,1C/1C"/>
 	</switches>
 
-	<!-- Index 1: byte = variant(3) | rot_flip(bit3) — SRD renders 180° vs Gyrodine (internal
-	     flip_screen we don't yet apply), so flip the rotation: 0x0B -->
+	<!-- Index 1: byte = variant(3) | rot_flip(bit3) — SRD Mission needs the opposite rotation
+	     direction from Gyrodine to render upright. flip_screen is hardwired off in the RTL (see
+	     Kyugo_CPU.sv), so this is supplied entirely by rot_flip, not by the game's own flip
+	     request: 0x0B -->
 	<rom index="1">
 		<part>0B</part>
 	</rom>

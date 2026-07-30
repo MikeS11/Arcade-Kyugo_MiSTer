@@ -31,10 +31,10 @@
 		<dip bits="11,12,13" name="Coin B"         ids="5C/1C,4C/1C,3C/1C,2C/1C,3C/4C,1C/3C,1C/2C,1C/1C"/>
 	</switches>
 
-	<!-- Index 1: variant_sel[2:0] | rot_flip[3] | no_rotate[4]. FIX 2026-06-12: the Flashgal (Sega) ROMs run
-	     the REPULSE hardware map (sub shared @ A000, AY1 @ port 00, inputs C000/C040/C080) per MAME
-	     GAME(flashgal,...,repulse,...). So variant = 1 (REPULSE), NOT 2 (flashgala = E000/AY40). Keep
-	     no_rotate (ROT0). 0x12 (var 2) made the sub's $FF->A004 land nowhere => SUB CHECK lock. -> 0x11 -->
+	<!-- Index 1: variant_sel[2:0] | rot_flip[3] | no_rotate[4]. Flashgal (Sega) runs the REPULSE
+	     hardware map (sub shared @ A000, AY1 @ port 00, inputs C000/C040/C080) per MAME
+	     GAME(flashgal,...,repulse,...) — variant = 1 (REPULSE), NOT 2 (flashgala's E000/AY40 map).
+	     ROT0/horizontal -> no_rotate set: byte = 0x11. -->
 	<rom index="1">
 		<part>11</part>
 	</rom>

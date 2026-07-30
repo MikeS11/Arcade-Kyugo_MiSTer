@@ -41,15 +41,12 @@
 
 	<!-- Index 1: variant selector (0 = Gyrodine) -->
 	<!-- core_config: bits[2:0]=variant_sel (0=VAR_GYRO), bit3=rot_flip, bit4=no_rotate (ROT0 sets) -->
-	<!-- rot_flip=0 (bit3 clear) => rotate CCW. This is a MATCHED PAIR with FLIP-PATH-BYPASS-2026-07-29
-	     in rtl/Kyugo_CPU.sv, which forces the render's flip_screen to 0. A 180 degree flip and the
-	     rotation commute, so unflipped-render + CCW == flipped-render + CW; we take the unflipped one
-	     because that is the same proven render path SRD Mission and Repulse use, and Gyrodine's flip
-	     path has never rendered correctly. Do NOT set bit 3 here without also un-forcing flip_screen
-	     in the RTL, or Gyrodine lands 180 degrees out. Gyrodine is intentionally the only ROT90 set
-	     with bit3 clear; Repulse (09) and SRD Mission (0B) set it because they never assert flip.
-	     Tried and reverted 2026-07-29: part 08 (rot_flip=1/CW) with flip_screen honoured — correct
-	     orientation but mangled text, since it routes Gyrodine through the broken flip branches. -->
+	<!-- rot_flip=0 (bit3 clear) => rotate CCW. In rtl/Kyugo_CPU.sv, flip_screen is hardwired to 0 and
+	     the render stays unflipped; a 180 degree flip and the rotation direction commute, so
+	     unflipped-render + CCW == flipped-render + CW. This is a MATCHED PAIR: do not set bit 3 here
+	     without also un-forcing flip_screen in the RTL, or Gyrodine renders 180 degrees out. Gyrodine
+	     is intentionally the only ROT90 set with bit3 clear; Repulse (09) and SRD Mission (0B) set it
+	     because they never assert their own flip request. -->
 	<rom index="1">
 		<part>00</part>
 	</rom>
@@ -61,15 +58,11 @@
 		<part crc="4e9323bd" name="a21.03"/>
 		<part crc="57e659d4" name="a21.04"/>
 		<part crc="1e7293f3" name="a21.05"/>
-		<!-- Sub CPU 32KB region (8KB ROM + 24KB pad).
-		     FIX 2026-05-29: the selector (rom_loader.sv) reserves 0x08000-0x0FFFF
-		     (32KB) for sub_rom so the larger sub ROMs of Repulse/Flashgal/
-		     SRDMission/Legend fit the shared layout. Gyrodine's sub is only 8KB,
-		     so it MUST be padded to the full 32KB here. The old 8KB pad made this
-		     region only 16KB, shifting fg/bg/sprite/color-PROMs all 16KB early —
-		     the color PROMs fell off the end of the blob, so prom_r/g/b loaded
-		     ZEROS => empty palette => whole screen black. Found via the palette-
-		     swatch diagnostic (swatch read all-black). -->
+		<!-- Sub CPU 32KB region (8KB ROM + 24KB pad). The shared ROM loader reserves a fixed
+		     0x08000-0x0FFFF (32KB) window for sub_rom across all variants, sized for the larger
+		     sub ROMs of Repulse/Flashgal/SRDMission/Legend. Gyrodine's sub is only 8KB, so it MUST
+		     be padded out to the full 32KB here or every region after it (fg/bg/sprite/color PROMs)
+		     shifts early and the palette PROMs load zeros. -->
 		<part crc="b2ce0aa2" name="a21.01"/>
 		<part repeat="24576"> 00 </part>
 		<!-- FG 4KB -->

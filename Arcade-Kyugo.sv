@@ -216,12 +216,10 @@ assign BUTTONS = 0;
 
 wire [1:0] ar = status[14:13];
 
-// --- Output aspect ratio: follow the GAME orientation, not status[12] alone (mirrors Qix gold) ---
-// Kyugo is MIXED-orientation per MAME ROT (vertical: Gyrodine/Repulse/99/SonOfPhoenix/SRD;
-// horizontal: Flashgal/Legend/Airwolf). 'landscape' reuses the SAME orientation term that drives the
-// rotation's no_rotate wire below (status[12] | core_config[4]), minus the direct_video output-path bit,
-// so the AR can NEVER disagree with screen_rotate — independent of any (possibly-wrong) per-bit comment.
-// Fleet AR audit 2026-06-17. Original keyed off raw status[12], which left the horizontal games squished.
+// Output aspect ratio follows the GAME orientation, not status[12] alone. Kyugo is MIXED-orientation
+// per MAME ROT (vertical: Gyrodine/Repulse/99/SonOfPhoenix/SRD; horizontal: Flashgal/Legend/Airwolf).
+// 'landscape' reuses the same orientation term that drives the rotation's no_rotate wire below
+// (status[12] | core_config[4]), so the AR can never disagree with screen_rotate.
 wire landscape = status[12] | core_config[4];
 assign VIDEO_ARX = landscape ? ((!ar) ? 12'd4 : (ar - 1'd1)) : ((!ar) ? 12'd3 : (ar - 1'd1));
 assign VIDEO_ARY = landscape ? ((!ar) ? 12'd3 : 12'd0)       : ((!ar) ? 12'd4 : 12'd0);
@@ -341,32 +339,25 @@ assign cfg_write = 0;
 assign cfg_address = 0;
 assign cfg_data = 0;
 
-// DIAG-REVERT-2026-05-29 (PLL-lock reset + AUTO SECOND-RESET):
-//  (a) `| ~locked` holds the CPUs in reset until the PLL is locked (kept — correct hardware).
-//  (b) AUTO SECOND-RESET: a cold boot deterministically sits on "SUB CHECK FFFF" until a manual
-//      soft reset. The watchdog can't recover it — the self-test keeps KICKING the watchdog while
-//      it waits on the sub, so the dog never times out. So automate the known-good manual soft
-//      reset: a ONE-SHOT that asserts a full reset ~4s after the first reset releases. SAFE: cold
-//      boot never self-succeeds, so the one-shot can only ever kick an already-failed boot, never
-//      a good one. RAM is preserved (no re-download) = exactly the manual soft reset. Armed once
-//      per power-on (RESET). TUNE ASR_AT: must be > time-to-reach-SUB-CHECK; lower for faster boot.
-//      Revert = `wire reset = reset_base;` and delete the FSM.
+// `| ~locked` holds the CPUs in reset until the PLL is locked -- correct hardware behavior, kept.
+//
+// AUTO SECOND-RESET (ASR): a cold boot deterministically sits on "SUB CHECK FFFF" until a manual
+// soft reset -- the watchdog can't recover it because the self-test keeps kicking the watchdog
+// while it waits on the sub, so the dog never times out. This automates the known-good manual
+// soft reset: a one-shot that asserts a full reset ~4s after the first reset releases. Safe
+// because it only ever fires after a real reset event, and RAM is preserved (no re-download),
+// matching exactly what a manual soft reset does. Armed once per power-on. ASR_AT must exceed the
+// time to reach SUB CHECK; lower it for a faster retry.
 wire base_cond = RESET | status[0] | buttons[1] | ioctl_download | ~locked;
 
-// DIAG-REVERT-2026-05-30 (SETTLE-HOLD experiment — the user's "force a wait until ready" idea):
-//   USE_SETTLE_HOLD=1 -> hold ALL CPUs in reset for SETTLE_CYCLES after base_cond clears, then
-//   release ONCE (no retry). This isolates WHY the ASR works: if the cold-boot SUB CHECK is pure
-//   readiness/timing, Gyrodine boots CLEAN (no visible reset flash). If it still hangs even with a
-//   generous hold, the *restart* (not the wait) is what fixes it -> the BRAM is fine and the failed
-//   first attempt corrupts state that only a reset clears. NOTE: FPGA BRAM does NOT "settle" — once
-//   ioctl_download writes it (reset held through download) it reads correct on the next clock — so my
-//   bet is the restart matters; this is the clean way to find out.
-//   USE_SETTLE_HOLD=0 -> EXACTLY the original auto-second-reset RETRY (known-good for Gyrodine).
-//   If the hold works, tune SETTLE_CYCLES DOWN to the smallest that still boots = the real settle time.
-localparam        USE_SETTLE_HOLD = 1'b0;   // EXPERIMENT DONE 2026-05-30: a 4s hold still hung Gyrodine
-                                             // (SUB CHECK FFFF) -> NOT timing; the ASR *restart* is what
-                                             // fixes it (RAM preserved across reset). Reverted to ASR.
-localparam [27:0] SETTLE_CYCLES   = 28'd200_000_000;   // ~4.07 s @ 49.152 MHz (decisive first test; tune down)
+// SETTLE-HOLD is an alternate reset strategy, permanently disabled (USE_SETTLE_HOLD=0): instead of
+// letting SUB CHECK fail and then retrying (ASR, below), it would hold all CPUs in reset for
+// SETTLE_CYCLES after base_cond clears and release once, with no retry. Confirmed not to help --
+// a generous hold still leaves Gyrodine on SUB CHECK, so the cold-boot failure is not a
+// readiness/timing issue; the ASR *restart* itself is what recovers it. Left in place, disabled,
+// as a documented alternate should the ASR ever need reconsidering.
+localparam        USE_SETTLE_HOLD = 1'b0;
+localparam [27:0] SETTLE_CYCLES   = 28'd200_000_000;   // ~4.07 s @ 49.152 MHz
 reg  [27:0] settle_cnt  = 28'd0;
 reg         settle_done = 1'b0;
 always_ff @(posedge CLK_49M) begin
@@ -379,8 +370,8 @@ end
 wire settle_hold = USE_SETTLE_HOLD & ~base_cond & ~settle_done;
 wire reset_base  = base_cond | settle_hold;            // CPUs held through the settle window
 
-// Original AUTO SECOND-RESET retry (see 337-346). Auto-disabled while the settle-hold runs so the
-// two can't fight; flip USE_SETTLE_HOLD=0 to restore it byte-for-byte.
+// ASR retry, per the base_cond comment above. Auto-disabled while settle-hold is active so the two
+// can't fight (they never both run since USE_SETTLE_HOLD is fixed at 0).
 localparam [27:0] ASR_AT = 28'd200_000_000;     // ~4.07 s @ 49.152 MHz (after SUB CHECK has failed)
 reg  [27:0] asr_cnt   = 28'd0;
 reg         asr_pulse = 1'b0;
@@ -390,11 +381,8 @@ always_ff @(posedge CLK_49M) begin
         asr_cnt <= 28'd0; asr_pulse <= 1'b0; asr_done <= 1'b0;
     end else if (reset_base) begin
         asr_cnt <= 28'd0;                         // hold off while any base reset is active
-    // DIAG-2026-05-29: ASR is a GYRODINE-ONLY cold-boot hack — variant 0 only; also OFF when the
-    // settle-hold experiment is active so they don't fight. Was: `end else if (!asr_done)`.
-    // ASR-UNIVERSAL-2026-06-12: was gated to Gyrodine (variant 0) because "sisters halted on 00 after
-    // the kick" — that "00" was the DSW-Freeze bug, now FIXED. Cold-boot SUB CHECK is universal, so kick
-    // ALL variants. Gyrodine-only was: end else if (!asr_done && core_config[2:0] == 3'd0 && !USE_SETTLE_HOLD)
+    // ASR applies to all variants: the cold-boot SUB CHECK handshake gap is universal, not specific
+    // to Gyrodine.
     end else if (!asr_done && !USE_SETTLE_HOLD) begin
         asr_cnt <= asr_cnt + 28'd1;
         if (asr_cnt == ASR_AT)                  asr_pulse <= 1'b1;                          // fire auto soft-reset
@@ -475,10 +463,8 @@ pause #(8,8,8,49) pause
 	.*,
 	.clk_sys(CLK_49M),
 	.user_button(m_pause),
-	// DIAG-REVERT-2026-05-29 (hiscore disabled): hiscore drives hs_pause -> pause_request,
-	// which pauses BOTH Z80s. A stuck hiscore pause = hard lock (known past offender; the
-	// Gyrodine HS RAM region is unidentified). Cut the path so hiscore can't freeze the CPUs.
-	// .pause_request(hs_pause),
+	// Hiscore is not allowed to pause the CPUs: hs_pause -> pause_request would freeze both Z80s,
+	// and a stuck hiscore pause is a hard lock. Forced off here regardless of hs_pause's value.
 	.pause_request(1'b0),
 	.options(~status[26:25])
 );
@@ -497,7 +483,7 @@ always_ff @(posedge CLK_49M) begin
         core_config <= ioctl_dout;
 end
 
-wire rot_flip = core_config[3];  // DIAG-2026-05-29: was [0] (collided with variant_sel[0]); decoupled to bit 3
+wire rot_flip = core_config[3];  // decoupled from bit 0 to avoid colliding with variant_sel[0]
 
 ///////////////                 Video                  ////////////////
 
@@ -524,10 +510,9 @@ wire [7:0] b = (b_out[0] ? 8'h19 : 8'h00) +
 wire ce_pix;
 
 wire rotate_ccw = rot_flip ? 0 : 1;
-// DIAG-2026-05-29: rot_flip was core_config[0], which COLLIDED with variant_sel[0] (Kyugo.sv:84)
-// → rotation = variant&1 (Repulse/SRD flipped vs Gyrodine). Decoupled to bit 3 (variant_sel still
-// uses [2:0]). All ROT90 sets (Gyro/Repulse/SRD) now share rot_flip=0 → rotate the same way.
-// no_rotate bit 4 = per-game "horizontal" (ROT0 sets Flashgal/Legend) so they aren't rotated.
+// rot_flip lives at core_config bit 3, separate from variant_sel[2:0], so the two never collide.
+// no_rotate (bit 4) marks the per-game "horizontal" ROT0 sets (Flashgal/Legend/Airwolf) so they
+// are not rotated at all.
 wire no_rotate = status[12] | direct_video | core_config[4];
 wire flip = ~no_rotate ^ status[11];
 wire video_rotated;
@@ -551,17 +536,10 @@ arcade_video #(288, 24) arcade_video
 // Assemble player control bytes for Kyugo (active HIGH)
 // p1/p2: {2'b00, btn2, btn1, right, left, down, up}
 // sys:   {2'b00, service, start2, start1, 1'b0, coin2, coin1}
-// CTRL-ROT-AXIS-FIX-2026-07-29: the bit names above are in the GAME's frame, which on the ROT90 sets is
-// 90 degrees from the player's frame — so the `right/left` bits drive PERCEIVED up/down and the `down/up`
-// bits drive PERCEIVED left/right. Proven on HW: swapping bits 3/2 changed perceived up/down.
-// The old `rot_flip ? m_up : m_down` conditional on bits 1/0 was therefore inverting perceived LEFT/RIGHT
-// on the two rot_flip=1 sets (Repulse, SRD Mission) — the reported bug. It was almost certainly a
-// workaround for the Gyrodine orientation bug fixed earlier today; with orientation correct, no per-set
-// control swap is needed at all. Now matches the documented bit order with no special-casing.
-// Bit-identical for all four rot_flip=0 sets (Gyrodine/Flashgal/Legend/Airwolf), which tested correct.
-// DIAG-REVERT-2026-07-29: originals below
-// wire [7:0] p1_controls  = {2'b00, m_fire1b, m_fire1, m_right1, m_left1, rot_flip ? m_up1 : m_down1, rot_flip ? m_down1 : m_up1};
-// wire [7:0] p2_controls  = {2'b00, m_fire2b, m_fire2, m_right2, m_left2, rot_flip ? m_up2 : m_down2, rot_flip ? m_down2 : m_up2};
+// The bit names above are in the GAME's frame, which on the ROT90 sets is 90 degrees from the
+// player's frame: the right/left bits drive perceived up/down, and the down/up bits drive
+// perceived left/right. This holds identically across all sets regardless of rot_flip, so no
+// per-set control swap is needed.
 wire [7:0] p1_controls  = {2'b00, m_fire1b, m_fire1, m_right1, m_left1, m_down1, m_up1};
 wire [7:0] p2_controls  = {2'b00, m_fire2b, m_fire2, m_right2, m_left2, m_down2, m_up2};
 wire [7:0] sys_controls = {2'b00, btn_service, m_start2, m_start1, 1'b0, m_coin2, m_coin1};
@@ -606,10 +584,9 @@ Kyugo kyugo_inst
 	.hs_address(hs_address),
 	.hs_data_out(hs_data_out),
 	.hs_data_in(hs_data_in),
-	// DIAG-REVERT-2026-05-29 (hiscore disabled): hs_write hijacks port A of the SHARED RAM
-	// (the main<->sub handshake region — hiscore is wired only to shared_ram here). Force 0
-	// so hiscore can never write/corrupt the handshake. Restore = .hs_write(hs_write_enable).
-	// .hs_write(hs_write_enable)
+	// hs_write is forced off: it would hijack port A of the shared RAM (the main<->sub handshake
+	// region -- hiscore is wired only to shared_ram), so this keeps hiscore from ever
+	// writing/corrupting the handshake.
 	.hs_write(1'b0)
 );
 

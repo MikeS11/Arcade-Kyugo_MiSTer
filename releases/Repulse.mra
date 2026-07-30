@@ -32,8 +32,9 @@
 		<dip bits="14,15"    name="Difficulty"      ids="Hardest,Hard,Normal,Easy"/>
 	</switches>
 
-	<!-- Index 1: byte = variant(1) | rot_flip(bit3) — Repulse renders 180° vs Gyrodine (internal
-	     flip_screen we don't yet apply), so flip the rotation: 0x09 -->
+	<!-- Index 1: byte = variant(1) | rot_flip(bit3) — Repulse needs the opposite rotation direction
+	     from Gyrodine to render upright. flip_screen is hardwired off in the RTL (see Kyugo_CPU.sv),
+	     so this is supplied entirely by rot_flip, not by the game's own flip request: 0x09 -->
 	<rom index="1">
 		<part>09</part>
 	</rom>

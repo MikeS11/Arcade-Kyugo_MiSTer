@@ -45,27 +45,18 @@ module Kyugo_CPU
 //------------------------------------------------------- Clock enables -------------------------------------------------------//
 
 // Pixel clock: 49.152 MHz * 4/32 = 6.144 MHz = XTAL/3 (matches MAME set_raw(XTAL/3, 396, 0, 288, 260, 16, 240) → 59.6575 Hz).
-// Restored 2026-05-16: a previous edit replaced this with a manual 5-bit counter using
-// `cen_pix = (pix_div[4:2] == 3'd0)` — that's a 4-cycle-wide LEVEL, not a 1-cycle pulse,
-// so every `if (cen_pix)` block fired 4× per intended pixel. jtframe_frac_cen produces
-// the correct single-cycle pulse every 8 clk_49m cycles.
+// jtframe_frac_cen produces a single-cycle pulse every 8 clk_49m cycles; a manual counter
+// comparison (e.g. a bit-range == 0 test) instead yields a multi-cycle LEVEL, firing every
+// `if (cen_pix)` block several times per intended pixel.
 wire [1:0] pix_cen_o;
 jtframe_frac_cen #(2) pix_cen (.clk(clk_49m), .n(10'd4), .m(10'd32), .cen(pix_cen_o), .cenb());
 wire cen_pix = pix_cen_o[0];
 assign ce_pix = cen_pix;
 
-// cen_cpu = 3.072 MHz CPU clock-enable (free-running /16). NOTE 2026-05-29: a phase-lock
-// experiment (cen_cpu = cen_pix & cpu_phase, to mimic real HW's single-xtal ÷6/÷3 alignment)
-// was tried to fix the boot race but REGRESSED it (couldn't reach attract) — the real root
-// cause was the NMI PULSE WIDTH (see the cpu1_nmi block), not the clock phase. Reverted to
-// the original here; phase-lock version kept commented in case a residual phase issue surfaces.
+// cen_cpu = 3.072 MHz CPU clock-enable, free-running /16 division of clk_49m.
 reg [3:0] cpu_div = 4'd0;
 always_ff @(posedge clk_49m) cpu_div <= cpu_div + 4'd1;
 wire cen_cpu = (cpu_div == 4'd0);
-// PHASE-LOCK (tried 2026-05-29, regressed — see note above; re-enable only if needed):
-// reg  cpu_phase = 1'b0;
-// always_ff @(posedge clk_49m) if (cen_pix) cpu_phase <= ~cpu_phase;
-// wire cen_cpu = cen_pix & cpu_phase;
 
 reg ay_toggle = 1'b0;
 always_ff @(posedge clk_49m) if (cen_cpu) ay_toggle <= ~ay_toggle;
@@ -100,33 +91,26 @@ wire vblk = (v_cnt < 9'd16) | (v_cnt >= 9'd240);
 assign video_hblank = hblk;
 assign video_vblank = vblk;
 
-//wire [8:0] hs_start = 9'd300 + {5'd0, h_center};
-//wire [8:0] hs_end   = hs_start + 9'd16;
-//wire [8:0] vs_start = 9'd244 + {5'd0, v_center};
-//wire [8:0] vs_end   = vs_start + 9'd4;
-//assign video_hsync = (h_cnt_rot >= hs_start && h_cnt_rot < hs_end);
-//assign video_vsync = (v_cnt_rot >= vs_start && v_cnt_rot < vs_end);
-//assign video_csync = ~(video_hsync ^ video_vsync);
-
-wire [8:0] hs_start = 9'd292 + {5'd0, h_center};  // Try moving earlier into blanking (was 300)
+// HSYNC/VSYNC generation; h_center/v_center are OSD-adjustable centering offsets.
+wire [8:0] hs_start = 9'd292 + {5'd0, h_center};
 wire [8:0] hs_end   = hs_start + 9'd16;
-wire [8:0] vs_start = 9'd242 + {5'd0, v_center};  // Slight adjustment
+wire [8:0] vs_start = 9'd242 + {5'd0, v_center};
 wire [8:0] vs_end   = vs_start + 9'd4;
 assign video_hsync = (h_cnt_sync >= hs_start && h_cnt_sync < hs_end);
 assign video_vsync = (v_cnt_sync >= vs_start && v_cnt_sync < vs_end);
 assign video_csync = ~(video_hsync ^ video_vsync);
 
-// *** HACK — REQUIRED FOR BOOT, DO NOT REMOVE (cold-boot SUB CHECK is UNSOLVED) ***
+// HACK — REQUIRED FOR BOOT, DO NOT REMOVE. Cold-boot SUB CHECK handshake is unsolved: on power-up
+// the sub never writes its F004 handshake token, so the main CPU waits on it forever. Masked by
+// leaning on the (Gyrodine) watchdog: once main stops kicking $E000, a ~2s timeout fires a
+// RAM-preserving reset (reset_cpu), equivalent to a manual soft reset, and the retry succeeds.
 // combined CPU-subsystem reset = power reset OR a watchdog soft-reboot pulse (wdog_rst, from the
-// watchdog block below). reset_cpu pulses both Z80s + the LS259 mainlatch + NMI/IRQ state, like a
-// real board reset (RAM NOT cleared — the boot self-test re-inits it).
-// WHY IT'S A HACK: on COLD power-up the sub never writes its F004 handshake token → the main waits
-// on it forever (the real root cause, STILL UNFIXED). We MASK it by leaning on the (Gyrodine)
-// watchdog: main stops kicking E000 → ~2s timeout → RAM-preserving reset → the retry passes, like
-// a manual light reset. Proper fix = the sub-side cold-boot handshake. Until then this STAYS, or
-// the game won't boot. KILL SWITCH (only to work the real root): wdog_arm = 1'b0 → reset_cpu == reset.
-wire       wdog_rst;            // forward ref — assigned in the watchdog block below
-wire       wdog_arm = 1'b1;     // 1 = HACK ARMED (masks the unsolved cold-boot SUB CHECK; required to boot).
+// watchdog block below). reset_cpu pulses both Z80s + the LS259 mainlatch + NMI/IRQ state like a
+// real board reset; RAM is NOT cleared (the boot self-test re-inits it).
+// Proper fix is the sub-side cold-boot handshake itself; until then this hack must stay or the
+// game won't boot. To test the real root cause directly: wdog_arm = 1'b0 makes reset_cpu == reset.
+wire       wdog_rst;            // forward reference, driven by the watchdog block below
+wire       wdog_arm = 1'b1;     // 1 = hack armed (masks the unsolved cold-boot SUB CHECK; required to boot)
 wire       reset_cpu = reset & ~(wdog_rst & wdog_arm);
 
 //------------------------------------------------------- CPU1 — Main ---------------------------------------------------------//
@@ -144,15 +128,12 @@ T80s cpu1
 	.A(cpu1_A), .DI(cpu1_Din), .DO(cpu1_Dout)
 );
 
-// NMI: scanline 240, gated by nmi_mask.
-// NMI WIDTH (real fix): the T80 samples NMI_n for a FALLING EDGE only on CEN
-// ticks (OldNMI_n updates on CEN). A pulse narrower than one cen_cpu period can fall between
-// two CEN samples and be MISSED (see HDL/"Z80 NMI is edge-triggered sampled on CEN", surfaced
-// on Kangaroo). The OLD clear-on-M1 made the pulse phase-sensitively narrow — when v_cnt==240
-// landed next to an opcode fetch, the vblank NMI was dropped → main's NMI-driven loop stalled
-// → the boot/attract LOCK (pause/unpause re-phased the pulse wider → NMI taken → escaped).
-// FIX: hold NMI for a FIXED ~16 cen_cpu ticks so the edge is always sampled. Edge-triggered,
-// so the wide level is still exactly ONE NMI; ~16 CPU cycles releases long before next frame.
+// NMI: fires at scanline 240 (base_h_cnt==0, v_cnt==240), gated by nmi_mask.
+// The T80 core samples NMI_n for a falling edge only on CEN ticks, so a pulse narrower than one
+// cen_cpu period can fall between two samples and be missed entirely. Held HIGH for a fixed ~16
+// cen_cpu ticks (nmi_cnt) so the edge is always caught regardless of phase against the CPU's own
+// fetch cycle; still exactly one NMI since the CPU is edge-triggered, and the hold releases well
+// before the next frame's NMI.
 reg cpu1_nmi = 1'b0;
 reg [4:0] nmi_cnt = 5'd0;
 always_ff @(posedge clk_49m) begin
@@ -197,89 +178,35 @@ always_ff @(posedge clk_49m) begin
 	if (!reset_cpu) mainlatch <= 8'd0;  // reset_cpu: +watchdog (a real soft-reset clears the LS259)
 	else if (cen_cpu && cs_mainlatch) mainlatch[cpu1_A[2:0]] <= cpu1_Dout[0];
 end
-// NMI enable = the game's own mainlatch[0]. An earlier "NMI bootstrap" force-enabled NMI to break
-// an apparent boot deadlock; that deadlock turned out to be the missed-NMI bug (narrow pulse dropped
-// on CEN), now fixed in the cpu1_nmi block above — so the bootstrap was removed (it caused flaky
-// startup once NMI was reliable). The v3 bootstrap is kept COMMENTED below as a restore path in case
-// a real boot deadlock ever reappears.
-reg ml0_seen = 1'b0;   // kept (unused now) for easy restore of the v3 bootstrap
+// nmi_mask mirrors the game's own mainlatch[0] (the vblank-NMI enable the game controls itself).
+// ml0_seen is currently unused by any live logic.
+reg ml0_seen = 1'b0;
 always_ff @(posedge clk_49m) begin
 	if (!reset_cpu)        ml0_seen <= 1'b0;
 	else if (mainlatch[0]) ml0_seen <= 1'b1;
 end
-wire nmi_mask = mainlatch[0];   // REAL: the game controls its own vblank-NMI enable
-// v3 bootstrap (removed — restore if boot deadlocks):
-// wire nmi_mask = ml0_seen ? mainlatch[0] : (mainlatch[0] | mainlatch[2]);
-// FLIP-SCREEN-FIX-2026-07-01: was hardcoded 1'b0 (stubbed during initial bring-up, never
-// revisited). Verified via Gyrodine's own disassembly (Useful Information/gyrodine.dasm) —
-// its reset vector ($7E85, confirmed as the real boot entry via the `jp $7E85` at $0005)
-// unconditionally does `ld a,$01 / out ($01),a` at $7E92-7E94, setting mainlatch bit 1
-// (flip_screen) to 1 as a hardcoded part of ITS OWN boot code — not DIP-driven (DIP
-// Cabinet default is identical Upright across Gyrodine/Repulse/SRD Mission, checked and
-// ruled out). Our RTL's LS259 mainlatch emulation (line ~195-198) already correctly
-// implements the write_d0 semantics (address selects bit, data bit0 sets/clears) and this
-// exact bit was already probed once before (`ml1_ever`, "proves LS259 writes land") — so
-// mainlatch[1] itself is trustworthy, it just wasn't being read. MAME's own flip_screen()
-// (kyugo.cpp) is a PURE reflection of this latch bit — no XOR with anything else, so the
-// old commented-out `rot_flip ^ mainlatch[1]` reference was itself wrong (conflating
-// MAME's per-game flip signal with our separate rotation-direction bit).
-// NOT yet addressed by this fix (flag for follow-up, don't guess-fix in the same commit):
-// (1) our BG code responds to flip_screen by mirroring the screen coordinate (base_h_cnt
-//     -> 287-base_h_cnt); MAME instead negates the scroll register and leaves the
-//     coordinate alone — these aren't the same transform, may need reconciling once this
-//     is live and testable. (2) sprite draw has ZERO flip_screen handling at all (MAME
-//     mirrors sprite Y, inverts per-sprite flipX/flipY, reverses row-stacking order when
-//     flipped) — if sprites look wrong after this compile, that's why.
-// ============================================================================================
-// FLIP-PATH-BYPASS-2026-07-29 — READ THIS BEFORE "FIXING" flip_screen AGAIN.
-//
-// `flip_screen` is forced to 0 ON PURPOSE. Everything above this line about mainlatch[1] is
-// factually correct — Gyrodine really does set it at $7E92, our LS259 decode really is right,
-// MAME really does honour it. The conclusion drawn from those facts was still wrong.
-//
-// WHY IT IS FORCED OFF: a 180 degree flip and the screen rotation COMMUTE, so
-//     render-unflipped + rotate CCW   ==   render-flipped + rotate CW
-// Both give the identical, correct final image. The first uses the exact same render path as
-// SRD Mission / Repulse / Flashgal — proven, five games stable on it. The second is the only
-// path Gyrodine ever took, and it has NEVER produced a correct frame in any compile.
-//
-// EVIDENCE (HW, 2026-07-29): with mainlatch[1] honoured and the flip-path maths made fully
-// self-consistent (FLIP-LAYERS-FIX-2026-07-29 (a)-(e), still present below and still believed
-// correct), Gyrodine rendered a clean 180 degree rotation with MANGLED TEXT — broken glyph
-// rows on every character — while SRD Mission, running byte-identical graphics code with
-// flip_screen=0, was perfect. flip_screen is the ONLY difference between them in the whole
-// video path, which localises the remaining corruption to the flip branches themselves.
-//
-// So: enter the proven path, and let the rotation stage absorb the 180 degrees. That means
-// Gyrodine.mra must stay at rot_flip=0 (core_config bit 3 clear, index=1 part 00) => CCW.
-// The two settings are a MATCHED PAIR. Changing one without the other puts Gyrodine 180 out.
-//
-// This restores the pre-2026-07-01 configuration, which is the last one known to render
-// Gyrodine correctly. FLIP-SCREEN-FIX-2026-07-01 was therefore a regression: it was right
-// about the hardware and wrong about what to do with it.
-//
-// The (a)-(e) flip-path fixes are deliberately LEFT IN, dormant. They only matter when
-// flip_screen==1, which now never happens. Live cocktail flip (Flashgal toggles the bit at
-// $1342/$1369) is the one case that would need them, and it needs the flip path debugged
-// first — separate job, not required by any of the 8 games' normal operation.
-//
-// DIAG-REVERT-2026-07-29: original below
-// wire flip_screen = mainlatch[1];
-// ============================================================================================
+wire nmi_mask = mainlatch[0];
+
+// flip_screen is hardwired to 0. A 180-degree flip and the screen_rotate stage commute
+// (render-unflipped + rotate-CCW == render-flipped + rotate-CW); the unflipped render path is
+// the one proven correct across every game on this core, so 180-degree sets get their rotation
+// from screen_rotate/rot_flip instead of from this coordinate mirror. Gyrodine.mra must keep
+// rot_flip=0 (core_config bit 3 clear, index=1 part 00) — flip_screen=0 and rot_flip=0 are a
+// matched pair. mainlatch[1] is still read elsewhere as flip_req (scroll_x negation, sprite
+// mirroring); only the screen-coordinate mirror here is disabled, so the per-layer
+// `^ flip_screen` code further down stays permanently unreachable while this is 0.
 wire flip_screen = 1'b0;
 wire cpu2_rst    = ~mainlatch[2];
 
 //------------------------------------------------------- Watchdog (Gyrodine) -------------------------------------------------//
-// Watchdog (the cold-boot SUB-CHECK recovery hack — see wdog_arm above): MAME gyrodine() adds WATCHDOG_TIMER; map(0xe000).w =
-// watchdog reset. A write to E000 kicks it; if the main CPU stops kicking for WDOG_TIMEOUT
-// frames, the board soft-resets (assert wdog_rst -> reset_cpu pulses both Z80s + the LS259
-// + NMI state, re-running boot). Gyrodine-only: other variants never increment so never
-// trip. Frame-clocked on the vblk rising edge (once/frame).
-//   TIMEOUT NOTE: the probe shows the main kicks E000 throughout boot (blue cell lit during
-//   the self-tests), so there is NO multi-second no-kick gap to protect — the timeout only
-//   needs to exceed the normal kick interval. 120 frames (~2 s) gives margin + fairly fast
-//   auto-retry of the attract-transition lock. Lower toward ~60 for faster retries; raise
-//   only if a legit long no-kick gap ever turns boot into a reset-loop.
+// Watchdog (the cold-boot SUB-CHECK recovery mechanism — see wdog_arm above): MAME gyrodine() adds
+// WATCHDOG_TIMER; map(0xe000).w = watchdog reset. A write to E000 kicks it; if the main CPU stops
+// kicking for WDOG_TIMEOUT frames, the board soft-resets (wdog_rst -> reset_cpu pulses both Z80s +
+// the LS259 + NMI state, re-running boot). Gyrodine-only: other variants never increment so never
+// trip. Frame-clocked on the vblk rising edge (once/frame). 120 frames (~2s) comfortably exceeds
+// the normal E000 kick interval during boot while still giving a fairly fast attract-lock retry;
+// lower toward ~60 for faster retries, raise only if a legitimate long no-kick gap ever causes a
+// reset-loop.
 localparam [8:0] WDOG_TIMEOUT = 9'd120;   // frames w/o an E000 kick before reboot (~2 s @ 60 Hz)
 reg  [8:0] wdog_frames = 9'd0;
 reg  [9:0] wdog_pulse  = 10'd0;           // reboot-pulse length, in clk_49m cycles
@@ -296,9 +223,9 @@ always_ff @(posedge clk_49m) begin
 		end else if (cs_watchdog & ~cpu1_WR_n) begin
 			wdog_frames <= 9'd0;                    // kicked
 		end else if (pause) begin
-			// WDOG-PAUSE-GATE-FIX-2026-07-29: pause freezes both Z80s (:140/:317) but NOT the video
-			// counters, so vblk kept ticking with no CPU alive to kick $E000 -> reset at ~2s in the
-			// OSD. Clear rather than freeze, so a nearly-expired count can't bite just after resume.
+			// Pause freezes both Z80s but not the video counters, so vblk keeps ticking with no CPU
+			// alive to kick $E000. Clear (not freeze) the counter so a nearly-expired count can't
+			// trip the watchdog just after resume.
 			wdog_frames <= 9'd0;
 		end else if (vblk & ~wdog_vblk_d & (variant_sel == VAR_GYRO)) begin
 			if (wdog_frames >= WDOG_TIMEOUT) begin
@@ -470,12 +397,9 @@ wire [7:0] shared_ram_D_cpu1, shared_ram_D_cpu2;
 wire       cs_shared_main = cs_shared | cs_shared_e;
 dpram_dc #(.widthad_a(11)) shared_ram (
 	.clock_a(clk_49m),
-	// REMOVE-HISCORE-2026-06-12: hiscore was wired ONLY into this shared RAM (the main<->sub
-	// handshake region). hs_write was already 1'b0, but strip the mux entirely so it can never
-	// touch the handshake. Re-add later targeting the real hiscore RAM. Originals:
-	// .address_a(hs_write ? hs_address[10:0] : cpu1_A[10:0]),
-	// .data_a(hs_write ? hs_data_in : cpu1_Dout),
-	// .wren_a((cs_shared_main & ~cpu1_WR_n) | hs_write),
+	// Hiscore is not wired into this port: it's the main<->sub handshake RAM, and mixing in a
+	// hiscore write here risks corrupting that handshake. hs_write is also tied off at 1'b0 in
+	// Arcade-Kyugo.sv; both together keep hiscore from ever touching this region.
 	.address_a(cpu1_A[10:0]),
 	.data_a(cpu1_Dout),
 	.wren_a(cs_shared_main & ~cpu1_WR_n),
@@ -607,39 +531,29 @@ eprom_32b prom_tim_rom (.CLK(clk_49m), .ADDR(5'd0), .CLK_DL(clk_49m),
 
 //----------------------------------------------- BG render pipeline -------------------------------------------------//
 
-// Screen coords (with flip)
-// FLIP-LAYERS-FIX-2026-07-29 (a): the vertical mirror constant was wrong. The visible window is
-// v_cnt 16..239 (`vblk = v_cnt<16 | v_cnt>=240`, Kyugo_CPU.sv:99) — it does NOT start at 0 the way
-// the horizontal one does (`hblk = base_h_cnt>=288` ⇒ visible 0..287). Mirroring a window [lo,hi]
-// about its own centre is `(lo+hi) - x`, so X is correctly `287 - base_h_cnt` (0+287) but Y must be
-// `255 - v_cnt` (16+239), not `239 - v_cnt`. As written, enabling flip_screen ALSO shifted the whole
-// BG up by exactly 16 lines = 2 tile rows. Unflipped path untouched (bit-identical).
-// DIAG-REVERT-2026-07-29: originals below
-// wire [8:0] bg_sx = flip_screen ? (9'd287 - base_h_cnt) : base_h_cnt;
-// wire [8:0] bg_sy = flip_screen ? (9'd239 - v_cnt)      : v_cnt;
+// Screen coords (mirrored about the visible window when flip_screen is set).
+// The visible window is v_cnt 16..239 (vblk = v_cnt<16 | v_cnt>=240, see hblk/vblk above), not
+// 0-based the way the horizontal window is (hblk = base_h_cnt>=288, visible 0..287). Mirroring a
+// window [lo,hi] about its own centre is (lo+hi)-x, so X is 287-base_h_cnt (0+287) but Y must be
+// 255-v_cnt (16+239), not 239-v_cnt -- using 239 shifts the whole BG up by 16 lines (2 tile rows).
 wire [8:0] bg_sx = flip_screen ? (9'd287 - base_h_cnt) : base_h_cnt;
 wire [8:0] bg_sy = flip_screen ? (9'd255 - v_cnt)      : v_cnt;
 
 // World coords (BG has set_scrolldx(-32) → +32 in world space when not flipped)
 wire [8:0] scroll_x_full = {scroll_x_hi, scroll_x_lo};
 
-// SCROLLX-NEGATE-FIX-2026-07-29: MAME negates BG scroll_x whenever the game requests flip
-// (kyugo.cpp:409-412 — `set_scrollx(0, -(lo + hi*256))` if flip_screen(), positive otherwise);
-// scroll_y is NOT negated (:414). FLIP-PATH-BYPASS forces the RENDER's flip_screen to 0 and lets
-// screen_rotate supply the 180 degrees, which is right for the coordinate mirror — but it also
-// dropped this scroll_x negation, which is a genuine part of flip semantics and NOT something the
-// rotation can supply (rotation transforms the finished frame; it cannot change which direction a
-// scroll counter walks the tilemap). Symptom: Gyrodine's land/sea scrolled smoothly but BACKWARDS
-// (HW 2026-07-29) while SRD Mission was perfect — SRD never asserts the flip bit, so it never
-// wanted the negation. Note Gyrodine is ROT90, so the scroll the player sees running vertically up
-// the portrait screen is this RENDER-space scroll_x (render is 288x224 landscape pre-rotation).
-// Gated on mainlatch[1] = the game's own flip request, so the 7 sets that never assert it are
-// bit-identical. Modular arithmetic: the subtraction wraps correctly mod 512 in the low 9 bits.
-// SCROLLDX-FLIP-FIX-2026-07-29: `set_scrolldx(-32, 288+32)` (kyugo.cpp:271) — 2nd arg is the
-// FLIPPED-mode dx. World offset = -dx, so flipped needs -320 == +192 (mod 512), not +32. Being off
-// by 288 (one screen width) put the window outside the tilemap region the game writes, so BG only
-// covered part of the screen. HW 2026-07-29: scroll direction correct, BG started ~halfway.
-wire flip_req = mainlatch[1];   // game asked for flip; honoured via screen_rotate, not in-render
+// MAME negates BG scroll_x whenever the game requests flip (kyugo.cpp:409-412: set_scrollx(0,
+// -(lo+hi*256)) if flip_screen() else positive; scroll_y is never negated, :414). flip_screen
+// itself is forced off in the render (screen_rotate supplies the 180 degrees instead), but the
+// scroll_x negation is a separate part of flip semantics that rotation cannot supply -- it changes
+// which direction the scroll counter walks the tilemap, not just how the finished frame is
+// mirrored. Gated on flip_req = mainlatch[1] (the game's own flip request), so the sets that never
+// assert it render bit-identical; the subtraction wraps correctly mod 512 in the low 9 bits.
+// World offset when not flipped is +32 (MAME set_scrolldx(-32, ...), kyugo.cpp:271; world offset =
+// -dx). The flipped-mode dx from that same call is 288+32=320, so the flipped offset is -320 =
+// +192 (mod 512), not +32 -- using +32 in both branches puts the fetch window a full screen width
+// off, so BG only covers half the screen.
+wire flip_req = mainlatch[1];   // game's own flip request; honoured via screen_rotate, not in-render
 wire [9:0] bg_world_x_pre = flip_req ? ({1'b0, bg_sx} - {1'b0, scroll_x_full} + 10'd192)
                                      : ({1'b0, bg_sx} + {1'b0, scroll_x_full} + 10'd32);
 wire [8:0] bg_world_x = bg_world_x_pre[8:0];   // wraps mod 512 (matches 64x8 = 512 BG width)
@@ -650,51 +564,39 @@ wire [4:0] bg_row = bg_world_y[7:3];   // 0..31
 wire [2:0] bg_fx  = bg_world_x[2:0];   // 0..7
 wire [2:0] bg_fy  = bg_world_y[2:0];
 
-// BG-ROWWRAP-LOOKAHEAD-FIX-2026-07-01: base_h_cnt's total period (396) is the
-// MAME-verified real hardware value (Useful Information/kyugo.cpp:946 —
-// screen.set_raw(18.432_MHz_XTAL/3, 396, 0, 288, 260, 16, 240)) and is NOT a multiple
-// of 8. That's fine for HSYNC (matches real hardware) but the BG fetch-ahead pipeline
-// below needs one full 8-tick window to fetch+latch+promote a tile before it's
-// displayed — and v_cnt (the row) only increments at the SAME tick base_h_cnt wraps
-// 395->0, too late for column 0 of the new row to be ready in time. Real hardware must
-// anticipate the row change a bit early; we do the same: during the LAST 8 ticks of
-// blanking, override the fetch target to "column 0 of the UPCOMING row" (v_cnt_next)
-// instead of the normal same-row off-screen lookahead column. bg_fx is glitch-free
-// through this whole window (the only discontinuity is the single 395->0 tick, which
-// falls right at this window's end), so the fx==0/1/2/7 sequence still fires cleanly
-// once each inside it — promote (fx==7) always lands in time for base_h_cnt==0.
-// Symptom this fixes: stale/wrong-stage BG tile data at one screen edge every line —
-// vertical band on Flashgal (no_rotate), horizontal band on Gyrodine (rotated) — same
-// root cause, axis differs only because screen_rotate is a downstream, content-agnostic
-// transform. Does NOT address the separate missing-HUD-icon symptom at the same
-// x-position (sprite/line-buffer swap logic resets at the same base_h_cnt==0 boundary,
-// Kyugo_CPU.sv:707-818, but via a different mechanism — untouched here).
-// DETERMINISTIC-LOOKAHEAD-FIX-2026-07-01 (v3, replaces WINDOW-SHIFT-FIX/WINDOW-WIDEN-FIX):
-// both prior attempts tried to find the right scroll-phase-relative WINDOW for a fetch
-// still sequenced by bg_fx (which drifts against base_h_cnt depending on scroll) — shift
-// made it worse, widen was better but incomplete. The actual fix: stop sequencing the
-// lookahead fetch by bg_fx at all. It's now driven directly by base_h_cnt (see the
-// `case (base_h_cnt)` blocks below, BG and FG), deterministic regardless of scroll, pinned
-// to promote at the latest possible tick (395). TIGHTEN-LOOKAHEAD-FIX then BISECT-LOOKAHEAD-
-// FIX-2026-07-01: fully-compressed (zero idle) tested worse than the original padded version
-// — not monotonic, there's a sweet spot, not an extreme. Currently bisecting: BG starts at
-// 390 (2-tick idle before promote), FG starts at 389 (1-tick idle). This range covers FG's
-// (earlier) start; BG's case statement simply idles (`default`) on 389.
-wire bg_row_lookahead = (base_h_cnt >= 9'd389);   // covers both sequences (FG starts earliest, at 389)
+// BG tile fetch pipeline runs one tile (8 pixels) behind what's displayed, driven by bg_fx during
+// normal display. base_h_cnt's total period (396, kyugo.cpp:946 screen.set_raw(...,396,0,288,260,
+// 16,240)) is not a multiple of 8, and v_cnt only increments on the same tick base_h_cnt wraps
+// 395->0 -- too late for column 0 of the new row to be ready via the normal same-row fetch. This
+// window re-primes the pipeline early, during the last part of hblank, so the first tile of the
+// new row is ready by base_h_cnt==0.
+//
+// bg_row_lookahead spans base_h_cnt 384..395. Two fetches happen back-to-back, sequenced directly
+// by base_h_cnt (not by bg_fx, which drifts against base_h_cnt with scroll and would otherwise make
+// the window's effective timing scroll-phase-dependent):
+//   384: address col_zero (bg_fetch_row/bg_fetch_col target the upcoming row)
+//   385: latch code/color/flip bits from col_zero; drive plane ROM addresses
+//   386: latch plane data into _nxt
+//   387: promote _nxt -> _lat -- col_zero becomes the tile that will be displayed at base_h_cnt==0
+//   388: address col_zero+1 (mod 64, correct for the 64-tile-wide BG map)
+//   389: latch code/color/flip bits from col_zero+1; drive plane ROM addresses
+//   390: latch plane data into _nxt -- left there for the line's first fx==7 to promote
+//   391-395: idle -- must NOT promote here, or the freshly primed _nxt (col_zero+1) is clobbered
+//            before the normal per-tile sequence gets to use it.
+// This keeps the steady-state invariant (_lat = currently displayed tile, _nxt = next tile) true
+// at base_h_cnt==0, for every scroll phase.
+wire bg_row_lookahead = (base_h_cnt >= 9'd384);
 
 wire [8:0] v_cnt_next      = (v_cnt == 9'd259) ? 9'd0 : (v_cnt + 9'd1);
-// FLIP-LAYERS-FIX-2026-07-29 (a, cont): same 16-line mirror-constant fix as bg_sy above. Must track
-// bg_sy exactly or the lookahead-fetched column 0 disagrees with the rest of the line when flipped.
-// DIAG-REVERT-2026-07-29: original below
-// wire [8:0] bg_sy_next      = flip_screen ? (9'd239 - v_cnt_next) : v_cnt_next;
+// Same mirror constant as bg_sy (255, not 239) -- must track it exactly or the lookahead-fetched
+// column 0 disagrees with the rest of the line once flipped.
 wire [8:0] bg_sy_next      = flip_screen ? (9'd255 - v_cnt_next) : v_cnt_next;
 wire [8:0] bg_world_y_next = bg_sy_next + {1'b0, scroll_y_r};
 wire [4:0] bg_row_next     = bg_world_y_next[7:3];
 
 wire [8:0] bg_sx_zero           = flip_screen ? 9'd287 : 9'd0;
-// SCROLLX-NEGATE-FIX-2026-07-29 (cont): must mirror bg_world_x_pre exactly — this is the lookahead's
-// column-0 fetch, and if its scroll sign differs from the main path, column 0 disagrees with the rest
-// of the line. DIAG-REVERT-2026-07-29: original was the unconditional `+ scroll_x_full` form.
+// Must mirror bg_world_x_pre's scroll-sign logic exactly -- this is the lookahead's column-0
+// fetch, and a mismatched scroll sign here would make column 0 disagree with the rest of the line.
 wire [9:0] bg_world_x_zero_pre  = flip_req ? ({1'b0, bg_sx_zero} - {1'b0, scroll_x_full} + 10'd192)
                                            : ({1'b0, bg_sx_zero} + {1'b0, scroll_x_full} + 10'd32);
 wire [8:0] bg_world_x_zero      = bg_world_x_zero_pre[8:0];
@@ -703,14 +605,10 @@ wire [5:0] bg_col_zero          = bg_world_x_zero[8:3];
 wire [4:0] bg_fetch_row = bg_row_lookahead ? bg_row_next : bg_row;
 wire [5:0] bg_fetch_col = bg_row_lookahead ? bg_col_zero : (bg_col + 6'd1);
 
-// FINE-Y-LOOKAHEAD-FIX-2026-07-01: the coarse row/col above were correctly overridden to
-// target the NEXT row during the lookahead window, but the FINE within-tile Y (bg_fy) used
-// below to address the actual GFX ROM plane data was NOT — it stayed on bg_world_y (built
-// from the OLD, not-yet-incremented v_cnt) throughout. Since fine-Y usually just increments
-// by 1 across a row boundary, this fetched the tile's CORRECT row-of-tiles but the WRONG
-// scanline-within-that-tile (one row stale) for the one tile this window covers — exactly
-// the reported symptom: a single 8px-wide column (the lookahead-fetched tile), off by
-// exactly one pixel row, everything else on screen unaffected.
+// The coarse row/col above target the NEXT row during the lookahead window; the fine within-tile
+// Y used to address GFX ROM plane data must follow the same override (bg_world_y_next, not the
+// old bg_world_y), or the lookahead-fetched tile gets the correct row but the wrong scanline
+// within it.
 wire [2:0] bg_fetch_fy = bg_row_lookahead ? bg_world_y_next[2:0] : bg_fy;
 
 // "next" = data being fetched for the upcoming 8-pixel tile
@@ -730,71 +628,75 @@ reg  [7:0] bg_p0_lat, bg_p1_lat, bg_p2_lat;
 //   fx=1: bgvram_rD / bgattr_rD valid → latch code, color, flip bits, fy_eff; drive plane ROM addrs
 //   fx=2: bg0_D / bg1_D / bg2_D valid → latch into _nxt
 //   fx=7: promote _nxt → _lat (becomes the displayed tile starting next fx=0)
-// DETERMINISTIC-LOOKAHEAD-FIX-2026-07-01: user tried the window-shift fix and reported it
-// got WORSE (leftmost columns "changing faster" during scroll) — the opposite of the
-// window-widen attempt, which was better but still ~1 frame stale. Direction of the effect
-// says fetching EARLIER (more safety margin before the wrap) makes staleness worse, and
-// fetching LATER (closer to the actual display moment) makes it better — i.e. freshness,
-// not spillover-safety margin, is what actually matters here. So: stop routing the
-// lookahead through bg_fx (whose timing within the window depends on scroll phase, which
-// is exactly the "sometimes early, sometimes late" behavior that caused the inconsistent
-// results) and instead drive it from base_h_cnt DIRECTLY — deterministic, always the same
-// ticks every line regardless of scroll, and pinned to complete (promote) at the LATEST
-// possible tick, 395, one cycle before the wrap. This also fully replaces the old
-// window-shift/widen mechanism; only one fetch path is active at a time (lookahead XOR
-// normal), so there's no ambiguity or redundant-cycle risk to reason about anymore.
+// During the row-wrap lookahead window (bg_row_lookahead), this sequence is driven directly by
+// base_h_cnt instead of bg_fx -- bg_fx's timing within the window depends on scroll phase, while
+// base_h_cnt gives the same fixed ticks every line regardless of scroll. Exactly one of the two
+// paths (lookahead XOR normal) is active on any given tick.
 always_ff @(posedge clk_49m) begin
     if (cen_pix) begin
         if (bg_row_lookahead) begin
-            // BISECT-LOOKAHEAD-FIX-2026-07-01: two data points now — 388/389/390/(4-tick idle)/395
-            // was "really really close" (best so far); 392/393/394/395 (0-tick idle, fully
-            // compressed) was "too far, worse". Not monotonic — there's a sweet spot somewhere
-            // between "some padding" and "none", not at either extreme. Splitting the
-            // difference: 390/391/392/(2-tick idle)/395, to bracket it further before assuming
-            // either endpoint is optimal.
             case (base_h_cnt)
-                9'd390: begin
+                // Two fetches happen here, not one: the first (384-387) promotes col_zero straight
+                // into _lat so it's ready to display at base_h_cnt==0; the second (388-390) primes
+                // _nxt with col_zero+1 so the mid-line invariant (_lat = displayed tile, _nxt = next
+                // tile) already holds by the time the line's first fx==7 promotes it. A single fetch
+                // would leave _nxt also holding col_zero with no pending fetch for col_zero+1, so the
+                // first fx==7 of the line (at base_h_cnt = 7-phi, phi = (scroll_x+32) mod 8, which
+                // drifts with scroll) would re-promote the same stale tile.
+                9'd384: begin
                     bgvram_raddr <= {bg_fetch_row, bg_fetch_col};
                     bgattr_raddr <= {bg_fetch_row, bg_fetch_col};
                 end
-                9'd391: begin
+                9'd385: begin
                     bg_code_nxt      <= {bgattr_rD[1:0], bgvram_rD};
                     bg_color_nxt     <= {bgpalbank, bgattr_rD[7:4]};
-                    // FLIP-LAYERS-FIX-2026-07-29 (b): the `^ flip_screen` terms here were a DOUBLE flip
-                    // that cancelled the screen mirror. We implement flip by mirroring the screen
-                    // COORDINATE (bg_sx/bg_sy above), so when flipped bg_world_x/y COUNT BACKWARDS as
-                    // the raster advances — which already reverses both the tile ORDER and the
-                    // pixel/line order WITHIN each tile, for free. XOR-ing flip_screen into the
-                    // fx-invert and fine-Y terms mirrored each tile a SECOND time, un-mirroring it:
-                    // net result was reversed tile order with individually un-reversed tiles (and the
-                    // matching line-order error vertically). Per-tile attr flips (bit2=flipX,
-                    // bit3=flipY, MAME get_bg_tile_info) still apply — only the screen-flip XOR goes.
-                    // Unflipped path bit-identical (x ^ 0 == x).
-                    // DIAG-REVERT-2026-07-29: originals below
-                    // bg_fx_invert_nxt <= bgattr_rD[2] ^ flip_screen;
-                    // bg_fy_eff        <= bg_fetch_fy ^ {3{bgattr_rD[3] ^ flip_screen}};
-                    // bg0_addr <= {1'b0, {bgattr_rD[1:0], bgvram_rD}, (bg_fetch_fy ^ {3{bgattr_rD[3] ^ flip_screen}})};
-                    // bg1_addr <= {1'b0, {bgattr_rD[1:0], bgvram_rD}, (bg_fetch_fy ^ {3{bgattr_rD[3] ^ flip_screen}})};
-                    // bg2_addr <= {1'b0, {bgattr_rD[1:0], bgvram_rD}, (bg_fetch_fy ^ {3{bgattr_rD[3] ^ flip_screen}})};
+                    // flip_screen is intentionally NOT XORed into fx-invert/fine-Y here. Flip is
+                    // implemented by mirroring the screen COORDINATE (bg_sx/bg_sy above), so when
+                    // flipped, bg_world_x/y already count backwards as the raster advances -- which
+                    // already reverses both tile order and the pixel/line order within each tile.
+                    // XOR-ing flip_screen into these terms as well would mirror each tile a second
+                    // time, cancelling that and reversing only the tile order. Per-tile attr flips
+                    // (bit2=flipX, bit3=flipY, MAME get_bg_tile_info) still apply as normal.
                     bg_fx_invert_nxt <= bgattr_rD[2];
                     bg_fy_eff        <= bg_fetch_fy ^ {3{bgattr_rD[3]}};
                     bg0_addr <= {1'b0, {bgattr_rD[1:0], bgvram_rD}, (bg_fetch_fy ^ {3{bgattr_rD[3]}})};
                     bg1_addr <= {1'b0, {bgattr_rD[1:0], bgvram_rD}, (bg_fetch_fy ^ {3{bgattr_rD[3]}})};
                     bg2_addr <= {1'b0, {bgattr_rD[1:0], bgvram_rD}, (bg_fetch_fy ^ {3{bgattr_rD[3]}})};
                 end
-                9'd392: begin
+                9'd386: begin
                     bg_p0_nxt <= bg0_D;
                     bg_p1_nxt <= bg1_D;
                     bg_p2_nxt <= bg2_D;
                 end
-                9'd395: begin
+                // promote fetch #1 (col_zero) into _lat — must happen BEFORE fetch #2 overwrites _nxt
+                9'd387: begin
                     bg_color_lat     <= bg_color_nxt;
                     bg_fx_invert_lat <= bg_fx_invert_nxt;
                     bg_p0_lat        <= bg_p0_nxt;
                     bg_p1_lat        <= bg_p1_nxt;
                     bg_p2_lat        <= bg_p2_nxt;
                 end
-                default: ; // idle (388-391): no longer used, freed up by tightening
+                // fetch #2 = col_zero+1, left in _nxt for the line's first fx==7 to promote.
+                // +1 wraps mod 64, which is correct for the 64-tile-wide BG map.
+                9'd388: begin
+                    bgvram_raddr <= {bg_fetch_row, (bg_col_zero + 6'd1)};
+                    bgattr_raddr <= {bg_fetch_row, (bg_col_zero + 6'd1)};
+                end
+                9'd389: begin
+                    bg_code_nxt      <= {bgattr_rD[1:0], bgvram_rD};
+                    bg_color_nxt     <= {bgpalbank, bgattr_rD[7:4]};
+                    bg_fx_invert_nxt <= bgattr_rD[2];
+                    bg_fy_eff        <= bg_fetch_fy ^ {3{bgattr_rD[3]}};
+                    bg0_addr <= {1'b0, {bgattr_rD[1:0], bgvram_rD}, (bg_fetch_fy ^ {3{bgattr_rD[3]}})};
+                    bg1_addr <= {1'b0, {bgattr_rD[1:0], bgvram_rD}, (bg_fetch_fy ^ {3{bgattr_rD[3]}})};
+                    bg2_addr <= {1'b0, {bgattr_rD[1:0], bgvram_rD}, (bg_fetch_fy ^ {3{bgattr_rD[3]}})};
+                end
+                9'd390: begin
+                    bg_p0_nxt <= bg0_D;
+                    bg_p1_nxt <= bg1_D;
+                    bg_p2_nxt <= bg2_D;
+                end
+                default: ; // 391-395 idle: no promote here, _lat/_nxt must survive to base_h_cnt==0
             endcase
         end else begin
             case (bg_fx)
@@ -805,17 +707,10 @@ always_ff @(posedge clk_49m) begin
                 3'd1: begin
                     bg_code_nxt      <= {bgattr_rD[1:0], bgvram_rD};
                     bg_color_nxt     <= {bgpalbank, bgattr_rD[7:4]};
-                    // BG-FLIP-SWAP-FIX-2026-06-12: MAME get_bg_tile_info uses TILE_FLIPYX((attr&0x0c)>>2) ⇒
-                    // flipX = attr BIT 2, flipY = attr BIT 3. We had them swapped (bit3/bit2 = the SPRITE
-                    // convention), mirroring BG tiles on the wrong axis. (FG has no per-tile flip — correct.)
-                    // FLIP-LAYERS-FIX-2026-07-29 (b, cont): same double-flip removal as the lookahead
-                    // block above — see that comment for the full reasoning. Must match it exactly.
-                    // DIAG-REVERT-2026-07-29: originals below
-                    // bg_fx_invert_nxt <= bgattr_rD[2] ^ flip_screen;            // flipX = attr bit 2 (MAME)
-                    // bg_fy_eff        <= bg_fetch_fy ^ {3{bgattr_rD[3] ^ flip_screen}}; // flipY = attr bit 3 (MAME)
-                    // bg0_addr <= {1'b0, {bgattr_rD[1:0], bgvram_rD}, (bg_fetch_fy ^ {3{bgattr_rD[3] ^ flip_screen}})};
-                    // bg1_addr <= {1'b0, {bgattr_rD[1:0], bgvram_rD}, (bg_fetch_fy ^ {3{bgattr_rD[3] ^ flip_screen}})};
-                    // bg2_addr <= {1'b0, {bgattr_rD[1:0], bgvram_rD}, (bg_fetch_fy ^ {3{bgattr_rD[3] ^ flip_screen}})};
+                    // MAME get_bg_tile_info: TILE_FLIPYX((attr&0x0c)>>2) -> flipX = attr bit 2, flipY =
+                    // attr bit 3. flip_screen is not XORed in here for the same reason as the lookahead
+                    // fetch above: the screen-coordinate mirror (bg_sx/bg_sy) already reverses tile and
+                    // pixel order for free.
                     bg_fx_invert_nxt <= bgattr_rD[2];                           // flipX = attr bit 2 (MAME)
                     bg_fy_eff        <= bg_fetch_fy ^ {3{bgattr_rD[3]}};        // flipY = attr bit 3 (MAME)
                     bg0_addr <= {1'b0, {bgattr_rD[1:0], bgvram_rD}, (bg_fetch_fy ^ {3{bgattr_rD[3]}})};
@@ -860,22 +755,20 @@ wire [4:0] fg_row = bg_sy[7:3];
 wire [2:0] fg_fx  = bg_sx[2:0];
 wire [2:0] fg_fy  = bg_sy[2:0];
 
-// FG-ROWWRAP-LOOKAHEAD-FIX-2026-07-01: FG has its OWN independent fetch-ahead pipeline
-// (below) and derives fg_fx straight from bg_sx[2:0] — since FG has no scroll, this tracks
-// base_h_cnt even more directly than BG's did, so it has the exact same row-wrap
-// discontinuity as BG-ROWWRAP-LOOKAHEAD-FIX-2026-07-01 above (see that comment for the
-// full mechanism). Reuses bg_row_lookahead/bg_sy_next/bg_sx_zero since FG's world coords
-// ARE the screen coords (no scroll offset to add).
+// FG has its own independent fetch-ahead pipeline (below); fg_fx derives straight from bg_sx[2:0],
+// and since FG has no scroll this tracks base_h_cnt directly, giving it the same row-wrap
+// discontinuity as the BG pipeline above (see that section for the full mechanism). Reuses
+// bg_row_lookahead/bg_sy_next/bg_sx_zero since FG's world coords ARE the screen coords (no scroll
+// offset to add).
 wire [4:0] fg_row_next = bg_sy_next[7:3];
 wire [5:0] fg_col_zero = bg_sx_zero[8:3];
 
 wire [4:0] fg_fetch_row = bg_row_lookahead ? fg_row_next : fg_row;
 wire [5:0] fg_fetch_col = bg_row_lookahead ? fg_col_zero : (fg_col + 6'd1);
 
-// FINE-Y-LOOKAHEAD-FIX-2026-07-01: same class of bug as BG's bg_fetch_fy above — fg_row/col
-// were overridden for the lookahead window but fg_fy (used below to address the FG tile ROM)
-// was not, fetching the right tile but the wrong scanline within it (one row stale) for the
-// lookahead-fetched tile specifically.
+// Same fine-Y override as bg_fetch_fy above: fg_row/col are overridden for the lookahead window,
+// and fg_fy (used below to address the FG tile ROM) must follow the same override or the
+// lookahead-fetched tile gets the correct row but the wrong scanline within it.
 wire [2:0] fg_fetch_fy = bg_row_lookahead ? bg_sy_next[2:0] : fg_fy;
 
 reg  [7:0] fg_code_nxt;
@@ -894,16 +787,10 @@ reg  [7:0] fg_byte_l_lat, fg_byte_r_lat;
 //   fx=7: promote _nxt → _lat
 always_ff @(posedge clk_49m) begin
     if (cen_pix) begin
-        // DETERMINISTIC-LOOKAHEAD-FIX-2026-07-01: same reasoning as the BG pipeline above —
-        // sequencing this by base_h_cnt directly (fixed ticks, every line) instead of fg_fx
-        // (scroll-phase-dependent timing) during the lookahead window, promoting at the
-        // latest possible tick (395) for maximum freshness.
+        // Same reasoning as the BG pipeline above: during the lookahead window this is sequenced by
+        // base_h_cnt directly (fixed ticks every line) instead of fg_fx, and promotes at the latest
+        // possible tick (395) for maximum freshness.
         if (bg_row_lookahead) begin
-            // BISECT-LOOKAHEAD-FIX-2026-07-01: BG's 4-tick-idle version tested best so far, 0-tick
-            // tested worse — splitting the difference. FG bracketed proportionally: was
-            // 388/389/390/391/392/(2-tick idle)/395 (best-so-far analog), tightened attempt was
-            // 390/391/392/393/394/395 (0-tick, analog of "too far"); middle here is a 1-tick gap:
-            // 389/390/391/392/393/(1-tick idle)/395.
             case (base_h_cnt)
                 9'd389: fgvram_raddr <= {fg_fetch_row, fg_fetch_col};
                 9'd390: begin
@@ -924,7 +811,7 @@ always_ff @(posedge clk_49m) begin
                     fg_byte_l_lat <= fg_byte_l_nxt;
                     fg_byte_r_lat <= fg_byte_r_nxt;
                 end
-                default: ; // idle (388-389): no longer used, freed up by tightening
+                default: ; // idle (388-389 unused)
             endcase
         end else begin
             case (fg_fx)
@@ -1006,13 +893,12 @@ wire [8:0] spr_lb_rdata = write_buf ? spr_lb_a_rdata : spr_lb_b_rdata;
 localparam [4:0] SS_IDLE = 5'd0,  SS_CLR  = 5'd1,  SS_FS0  = 5'd2,  SS_FS1  = 5'd3,
                  SS_FS2  = 5'd4,  SS_FR0  = 5'd5,  SS_FR1  = 5'd6,  SS_FRL  = 5'd7,
                  SS_FRR  = 5'd8,  SS_WPX  = 5'd9,  SS_NEXT = 5'd10,
-                 // SPR-READ-LATENCY-FIX-2026-06-13: dpram_dc/eprom q_a are UNREGISTERED
-                 // (outdata_reg_a="UNREGISTERED") → 1-cycle read latency, and the FSM's own
-                 // *_raddr register adds a second, so data for an address set in state N is
-                 // not valid until N+2. The FSM read at N+1 → every slot/gfx fetch sampled
-                 // one cycle early → garbage Y/code → sprites off-screen/missing. The BG FSM
-                 // uses the same primitive but is cen_pix-gated (4 clk/state) so never saw it.
-                 // These *W states are the inserted wait cycles (one per address-set).
+                 // dpram_dc/eprom q_a outputs are UNREGISTERED (outdata_reg_a="UNREGISTERED"): one
+                 // cycle of read latency, plus a second cycle from the FSM's own *_raddr register,
+                 // so data for an address set in state N isn't valid until N+2. These *W states are
+                 // the inserted one-cycle wait after each address-set state, one per fetch. (The BG
+                 // pipeline uses the same primitive but is cen_pix-gated at 4 clk/state, so it never
+                 // needed an explicit wait state.)
                  SS_FS0W = 5'd11, SS_FS1W = 5'd12, SS_FR0W = 5'd13, SS_FR1W = 5'd14,
                  SS_FRLW = 5'd15;
 
@@ -1027,7 +913,7 @@ reg [7:0] x_lo_lat;
 reg       x_hi_lat;
 reg [4:0] color_lat;
 reg [8:0] sy_full;
-reg signed [10:0] sx_full;   // SPR-X-WRAP-SIGNEXT-FIX-2026-07-01: was [8:0], see sx_calc below
+reg signed [10:0] sx_full;   // widened to 11 bits signed; see sx_calc below for why
 reg [3:0] y_in_tile;
 reg [9:0] code_lat;
 reg       flipx_lat, flipy_lat;
@@ -1047,40 +933,30 @@ wire [7:0] eval_y    = eval_y9[7:0];
 wire [8:0] sy_pre  = 9'd257 - {1'b0, sy_y_raw};
 wire [8:0] sy_calc = (sy_pre > 9'd240) ? (sy_pre - 9'd256) : sy_pre;
 wire [8:0] sx_pre  = {x_hi_lat, x_lo_lat};
-// SPR-X-WRAP-SIGNEXT-FIX-2026-07-01: was `wire [8:0] sx_calc = (sx_pre>320)?(sx_pre-9'd512):sx_pre`.
-// Two compounding problems in a 9-bit field: (1) the literal 9'd512 doesn't fit in 9 bits and
-// truncates to 0, making the subtraction a no-op; (2) even setting that aside, the downstream
-// sign-extension ({{2{sx_full[8]}}, sx_full}) treats bit8==1 as "negative" — but sx_pre in
-// [256,320] also has bit8 set despite being on the "stay positive" side of the >320 threshold
-// (MAME kyugo.cpp:369-370 does this subtraction in a wide int, where no such bit-8 ambiguity
-// exists). Result: any sprite with raw X in [256,320] sign-extends to a large negative value
-// (e.g. 300 -> -212) and fails the on-screen check for its ENTIRE width — a hard, consistent
-// vanish at X=256, well short of the real 288px edge, exactly the reported symptom. Fix: do
-// the subtraction in a properly wide (11-bit) signed field so 256..320 stays correctly
-// positive and only 321..511 goes negative.
+// MAME computes this sx wrap in a wide int (kyugo.cpp:369-370: sx = (x>320) ? x-512 : x), so there's
+// no bit-width ambiguity there. In a 9-bit field, two problems would compound: the literal 512
+// doesn't fit in 9 bits (truncates to 0, making the subtraction a no-op), and separately, sx_pre in
+// [256,320] sets bit 8 despite being on the "stay positive" side of the >320 threshold, which a
+// downstream sign-extension from bit 8 would misread as negative. Computed in an 11-bit signed
+// field instead so 256..320 stays positive and only 321..511 goes negative, matching MAME exactly.
 wire signed [10:0] sx_calc = (sx_pre > 9'd320) ? ($signed({2'd0, sx_pre}) - 11'sd512)
                                                 : $signed({2'd0, sx_pre});
 
 // Row hit (in SS_FR0): diff = eval_y - sy_full (9-bit two's complement); hit if diff[8:8]=0 (positive)
-// FLIP-LAYERS-FIX-2026-07-29 (c): sprite row-STACKING direction was missing. MAME draws cell row y at
-// `sx, flip ? sy - 16*y : sy + 16*y` (kyugo.cpp:401) — when flipped, the 16 cells of a sprite stack
-// UPWARD from sy instead of downward. Our per-scanline evaluator encodes stacking as
-// diff = eval_y - sy (cell index = diff[7:4], line-within-cell = diff[3:0]), so the mirrored form is
-// diff_f = (sy + 15) - eval_y, with line-within-cell becoming 15 - diff_f[3:0]:
+// Sprite row-stacking direction: MAME draws cell row y at `sx, flip ? sy - 16*y : sy + 16*y`
+// (kyugo.cpp:401) -- when flipped, the 16 cells of a sprite stack UPWARD from sy instead of
+// downward. The unflipped form encodes this as diff = eval_y - sy (cell index = diff[7:4],
+// line-within-cell = diff[3:0]); the flipped/mirrored form is diff_f = (sy+15) - eval_y, with
+// line-within-cell becoming 15 - diff_f[3:0]:
 //   eval_y = sy      -> diff_f = 15 -> cell 0, yint  0   (cell 0 top    = sy)     OK
 //   eval_y = sy + 15 -> diff_f =  0 -> cell 0, yint 15   (cell 0 bottom = sy+15)  OK
 //   eval_y = sy -  1 -> diff_f = 16 -> cell 1, yint 15   (cell 1 bottom = sy-1)   OK
 //   eval_y = sy - 16 -> diff_f = 31 -> cell 1, yint  0   (cell 1 top    = sy-16)  OK
 // This is the RAW line-within-cell; the per-sprite flipy mirror is applied downstream by
 // y_eff_now/y_eff_lat, so there is no double-application.
-// Deliberately kept at 9 bits: a true diff of 256..270 is out of range (a sprite is only 16 cells)
+// Deliberately kept at 9 bits: a true diff of 256..270 is out of range (a sprite is only 16 cells),
 // and the natural 9-bit wrap makes it read negative -> miss, the same property the unflipped path
 // already relies on. Widening to 10 bits would truncate cell index 16 to 0 and fake a hit.
-// DIAG-REVERT-2026-07-29: originals below
-// wire [8:0] hit_diff = {1'b0, eval_y} - sy_full;
-// wire       hit      = (hit_diff[8] == 1'b0);
-// wire [3:0] hit_row  = hit_diff[7:4];
-// wire [3:0] hit_yint = hit_diff[3:0];
 wire [8:0] hit_diff_norm = {1'b0, eval_y} - sy_full;
 wire [8:0] hit_diff_flip = (sy_full + 9'd15) - {1'b0, eval_y};
 wire [8:0] hit_diff = flip_screen ? hit_diff_flip : hit_diff_norm;
@@ -1090,25 +966,15 @@ wire [3:0] hit_yint = flip_screen ? (4'd15 - hit_diff[3:0]) : hit_diff[3:0];
 
 // Sprite code/flip from BRAM in SS_FR1 (combinational from BRAM outputs)
 wire [9:0] code_now  = {spram1_rD[0], spram1_rD[1], fgvram_spr_rD};
-// FLIP-LAYERS-FIX-2026-07-29 (d): per-sprite flip attributes must INVERT when the screen is flipped
-// (MAME kyugo.cpp:391-395 `if (flip) { flipx = !flipx; flipy = !flipy; }`). Unlike the BG — which
-// gets its mirror for free from the flipped screen coordinate — the sprite engine addresses gfx by
-// sprite-relative x/y (px_idx / y_in_tile), so nothing mirrors a sprite cell unless we ask.
-// Unflipped path bit-identical (x ^ 0 == x).
-// DIAG-REVERT-2026-07-29: originals below
-// wire       flipx_now = spram1_rD[3];
-// wire       flipy_now = spram1_rD[2];
-// SPR-FLIPX-RESTORE-FIX-2026-07-29: `SPR-X-UNMIRROR` above cancelled the rotation's X mirror by
-// writing `287 - (sx + px_idx)`, which cancelled the POSITION mirror (wanted — MAME leaves sx alone)
-// but ALSO cancelled the per-CELL mirror on that axis (not wanted — MAME inverts flipx when flipped,
-// kyugo.cpp:391-395). Net effect: sprites landed in the right place with each 16x16 cell mirrored the
-// wrong way along render X = the displayed VERTICAL. Symptom (HW 2026-07-29): correct position, but
-// the shadow upside down and the helicopter "kinda inside out". Restore the cell mirror via flipx.
-// flipy needs NO XOR here: the rotation's Y mirror already supplies MAME's flipy inversion, its sy
-// mirror and its stacking reversal all at once. Gated on flip_req ⇒ other 7 sets bit-identical.
-// DIAG-REVERT-2026-07-29: originals below
-// wire       flipx_now = spram1_rD[3] ^ flip_screen;
-// wire       flipy_now = spram1_rD[2] ^ flip_screen;
+// Per-sprite flip attributes must invert when the game requests flip (MAME kyugo.cpp:391-395:
+// if (flip) { flipx = !flipx; flipy = !flipy; }). Unlike the BG, which gets its mirror for free
+// from the flipped screen coordinate, the sprite engine addresses gfx by sprite-relative x/y
+// (px_idx / y_in_tile), so nothing mirrors a sprite cell unless asked explicitly.
+// flipx is XORed with flip_req: the screen_x pre-mirror below (screen_x_signed) cancels the
+// rotation's position mirror on this axis but not MAME's per-cell mirror, so flipx must supply
+// that mirror itself. flipy needs no XOR: the rotation's Y mirror already supplies MAME's flipy
+// inversion, sy mirror, and stacking reversal together. Gated on flip_req, so the sets that never
+// assert it are bit-identical.
 wire       flipx_now = spram1_rD[3] ^ flip_req;
 wire       flipy_now = spram1_rD[2];
 wire [3:0] y_eff_now = flipy_now ? (4'd15 - y_in_tile) : y_in_tile;
@@ -1127,22 +993,18 @@ wire       pix_p2     = byte2[bit_idx];
 wire [2:0] spr_pix    = {pix_p0, pix_p1, pix_p2};
 wire [7:0] spr_pal_idx = {color_lat[4:0], spr_pix[2:0]};
 
-// SPR-X-WRAP-SIGNEXT-FIX-2026-07-01: sx_full is already correctly signed+wide (see sx_calc
-// above) — no re-extension needed here, was the bug (re-deriving sign from bit8 of a
-// too-narrow field).
-wire signed [10:0] sx_signed    = sx_full;
+wire signed [10:0] sx_signed    = sx_full;   // already the correctly signed/widened value from sx_calc
 wire signed [10:0] screen_x_raw = sx_signed + $signed({7'd0, px_idx});
-// SPR-X-UNMIRROR-FIX-2026-07-29: MAME's sprite flip is ASYMMETRIC — it mirrors sy (240-sy),
-// inverts flipx/flipy and reverses stacking, but passes sx through UNCHANGED (kyugo.cpp:401).
-// screen_rotate mirrors BOTH render axes, which is correct for BG (MAME's tilemap flip also does
-// both) but over-mirrors sprites on X. Render X is the displayed VERTICAL on ROT90, so the symptom
-// was inverted sprite height: helicopter at the top instead of the bottom, enemies entering from
-// the bottom instead of the top (HW 2026-07-29). Pre-mirroring here cancels the rotation's X
-// mirror, leaving sprites unmirrored in display space, matching MAME. Mirroring preserves the
-// in-range test (out-of-range values stay out on both sides). Gated on flip_req ⇒ other 7 sets
-// bit-identical. Cell-internal orientation and stacking direction need no change: the rotation's
-// both-axis mirror already matches MAME inverting both flipx and flipy, and our +16y stacking
-// plus the rotation lands the same as MAME's -16y.
+// MAME's sprite flip is asymmetric: it mirrors sy (240-sy), inverts flipx/flipy and reverses
+// stacking, but passes sx through UNCHANGED (kyugo.cpp:401). screen_rotate mirrors both render
+// axes, which is correct for BG (MAME's tilemap flip also does both) but over-mirrors sprites on
+// X -- render X is the displayed vertical on the ROT90 sets. Pre-mirroring here cancels the
+// rotation's X mirror, leaving sprites unmirrored in display space to match MAME; mirroring
+// preserves the in-range test since out-of-range values stay out on both sides. Gated on
+// flip_req, so the sets that never assert it are bit-identical. Cell-internal orientation and
+// stacking direction need no separate correction: the rotation's both-axis mirror already
+// matches MAME inverting both flipx and flipy, and the +16y stacking used here plus the rotation
+// lands the same as MAME's -16y.
 wire signed [10:0] screen_x_signed = flip_req ? (11'sd287 - screen_x_raw) : screen_x_raw;
 wire               screen_x_in_range = (screen_x_signed >= 11'sd0) && (screen_x_signed < 11'sd288);
 
@@ -1192,19 +1054,19 @@ always_ff @(posedge clk_49m) begin
                 SS_FS1W: spr_st <= SS_FS2;                  // wait
                 SS_FS2: begin
                     color_lat <= spram0_rD[4:0];
-                    // FLIP-LAYERS-FIX-2026-07-29 (e): sprite Y mirror. MAME applies `if (flip) sy = 240 - sy;`
-                    // AFTER the 257-raw wrap (kyugo.cpp:376-377), so it goes here, on sy_calc, not on
-                    // sy_y_raw. NOTE: MAME does NOT mirror sprite X when flipped — sx is passed through
-                    // unchanged at kyugo.cpp:401 — so sx_full stays as-is. That asymmetry looks odd but it
-                    // is what the reference does; replicating it exactly, revisit only if HW disagrees.
-                    // DIAG-REVERT-2026-07-29: original below
-                    // sy_full   <= sy_calc;
-                    // SPR-Y-OFFSET-FIX-2026-07-29: MEASURED offset vs a matched MAME frame, two rounds:
-                    // -17 left it 1px short, -16 is dead-on (HW-confirmed). Derivation predicted an exact
-                    // match at -17 (MAME `240 - raw` vs ours `240 - raw`), so the residual 1px is a real gap
-                    // in that model — most likely the sprite line-buffer's one-line pipeline or the exact
-                    // mirror constant inside screen_rotate. MEASURED value wins; don't "correct" it back to
-                    // 17 from the algebra. Gated on flip_req: only the rotation-supplied-180 set needs it.
+                    // Sprite Y mirror: MAME applies `if (flip) sy = 240 - sy;` AFTER the 257-raw wrap
+                    // (kyugo.cpp:376-377), so it applies to sy_calc here, not to sy_y_raw. MAME does NOT
+                    // mirror sprite X when flipped -- sx is passed through unchanged at kyugo.cpp:401 --
+                    // so sx_full stays as-is; that asymmetry is intentional on the reference hardware,
+                    // not a bug here.
+                    //
+                    // The flip_req branch (sy_calc - 16) is a MEASURED offset against a matched MAME
+                    // reference frame, confirmed on hardware. The algebra from MAME's `240 - raw` predicts
+                    // -17; the measured, HW-confirmed value is -16. The 1px gap is real and most likely
+                    // lives in the sprite line-buffer's one-line pipeline or the exact mirror constant
+                    // inside screen_rotate. The measured value is what's correct on this core -- do not
+                    // "correct" it back to -17 from the algebra. Gated on flip_req: only the
+                    // rotation-supplied-180 sets need it.
                     sy_full   <= flip_screen ? (9'd240 - sy_calc)
                                              : (flip_req ? (sy_calc - 9'd16) : sy_calc);
                     sx_full   <= sx_calc;
@@ -1272,13 +1134,12 @@ end
 
 //----------------------------------------------- Composite + palette PROM lookup ------------------------------------//
 
-// Priority: sprite > FG > BG (sprite/FG pen 0 = transparent)
+// Priority: FG > sprite > BG (FG/sprite pen 0 = transparent). Matches MAME screen_update, which
+// draws BG → sprites → FG, so FG is always on top.
 wire       spr_opaque         = spr_lb_rdata[8];
 wire [7:0] spr_palette_index  = spr_lb_rdata[7:0];
 wire       fg_opaque          = (fg_pix != 2'b00);
 
-// RENDER-LAYER-FIX-2026-06-12: MAME screen_update draws BG → sprites → FG, so FG is ON TOP of sprites.
-// We had sprite>FG>BG (sprites covered the text). Match MAME: FG > sprite > BG.
 wire [7:0] composite_pal = fg_opaque  ? fg_palette_index  :
                            spr_opaque ? spr_palette_index :
                                         bg_palette_index;
