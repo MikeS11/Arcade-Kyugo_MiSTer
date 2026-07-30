@@ -339,57 +339,9 @@ assign cfg_write = 0;
 assign cfg_address = 0;
 assign cfg_data = 0;
 
-// `| ~locked` holds the CPUs in reset until the PLL is locked -- correct hardware behavior, kept.
-//
-// AUTO SECOND-RESET (ASR): a cold boot deterministically sits on "SUB CHECK FFFF" until a manual
-// soft reset -- the watchdog can't recover it because the self-test keeps kicking the watchdog
-// while it waits on the sub, so the dog never times out. This automates the known-good manual
-// soft reset: a one-shot that asserts a full reset ~4s after the first reset releases. Safe
-// because it only ever fires after a real reset event, and RAM is preserved (no re-download),
-// matching exactly what a manual soft reset does. Armed once per power-on. ASR_AT must exceed the
-// time to reach SUB CHECK; lower it for a faster retry.
-wire base_cond = RESET | status[0] | buttons[1] | ioctl_download | ~locked;
-
-// SETTLE-HOLD is an alternate reset strategy, permanently disabled (USE_SETTLE_HOLD=0): instead of
-// letting SUB CHECK fail and then retrying (ASR, below), it would hold all CPUs in reset for
-// SETTLE_CYCLES after base_cond clears and release once, with no retry. Confirmed not to help --
-// a generous hold still leaves Gyrodine on SUB CHECK, so the cold-boot failure is not a
-// readiness/timing issue; the ASR *restart* itself is what recovers it. Left in place, disabled,
-// as a documented alternate should the ASR ever need reconsidering.
-localparam        USE_SETTLE_HOLD = 1'b0;
-localparam [27:0] SETTLE_CYCLES   = 28'd200_000_000;   // ~4.07 s @ 49.152 MHz
-reg  [27:0] settle_cnt  = 28'd0;
-reg         settle_done = 1'b0;
-always_ff @(posedge CLK_49M) begin
-    if (base_cond)         begin settle_cnt <= 28'd0; settle_done <= 1'b0; end  // re-arm on any base reset
-    else if (!settle_done) begin
-        settle_cnt <= settle_cnt + 28'd1;
-        if (settle_cnt == SETTLE_CYCLES) settle_done <= 1'b1;                   // release once
-    end
-end
-wire settle_hold = USE_SETTLE_HOLD & ~base_cond & ~settle_done;
-wire reset_base  = base_cond | settle_hold;            // CPUs held through the settle window
-
-// ASR retry, per the base_cond comment above. Auto-disabled while settle-hold is active so the two
-// can't fight (they never both run since USE_SETTLE_HOLD is fixed at 0).
-localparam [27:0] ASR_AT = 28'd200_000_000;     // ~4.07 s @ 49.152 MHz (after SUB CHECK has failed)
-reg  [27:0] asr_cnt   = 28'd0;
-reg         asr_pulse = 1'b0;
-reg         asr_done  = 1'b0;
-always_ff @(posedge CLK_49M) begin
-    if (RESET) begin                              // hard power-on / core (re)load: arm the one-shot
-        asr_cnt <= 28'd0; asr_pulse <= 1'b0; asr_done <= 1'b0;
-    end else if (reset_base) begin
-        asr_cnt <= 28'd0;                         // hold off while any base reset is active
-    // ASR applies to all variants: the cold-boot SUB CHECK handshake gap is universal, not specific
-    // to Gyrodine.
-    end else if (!asr_done && !USE_SETTLE_HOLD) begin
-        asr_cnt <= asr_cnt + 28'd1;
-        if (asr_cnt == ASR_AT)                  asr_pulse <= 1'b1;                          // fire auto soft-reset
-        if (asr_cnt == ASR_AT + 28'd500_000) begin asr_pulse <= 1'b0; asr_done <= 1'b1; end // ~10ms pulse, then one-shot done
-    end
-end
-wire reset = reset_base | asr_pulse;
+// Hold both Z80s in reset until the PLL is locked and the ROM download has finished, so they never
+// execute against an unstable clock or partial ROM data.
+wire reset = RESET | status[0] | buttons[1] | ioctl_download | ~locked;
 
 ///////////////////         Keyboard           //////////////////
 

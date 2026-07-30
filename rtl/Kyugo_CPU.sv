@@ -243,10 +243,15 @@ wire [15:0] cpu2_A;
 wire [7:0]  cpu2_Dout;
 wire        cpu2_WR_n, cpu2_RD_n, cpu2_MREQ_n, cpu2_IORQ_n, cpu2_M1_n, cpu2_RFSH_n;
 
-T80pa cpu2
+T80s cpu2
 (
 	.RESET_n(reset_cpu & ~cpu2_rst), .CLK(clk_49m),  // reset_cpu: +watchdog
-	.CEN_p(cen_cpu & ~pause), .CEN_n(~cen_cpu & ~pause),
+	// Both Z80s are identical 3.072 MHz parts on the real board, so they must share one timing model:
+	// the boot handshake depends on their RELATIVE speed. The main releases the sub, runs a 32KB ROM
+	// checksum, then reads $F000 ONCE expecting the $FF the sub leaves there (gyro_main.asm $7F20 ->
+	// $7F51, gyro_sub.asm $0268). Using a different T80 wrapper here made the sub lose that race and
+	// the self-test reported "SUB CHECK". Keep this identical to cpu1.
+	.CEN(cen_cpu & ~pause),
 	.WAIT_n(1'b1),
 	.INT_n(~cpu2_irq), .NMI_n(1'b1),
 	.M1_n(cpu2_M1_n), .MREQ_n(cpu2_MREQ_n), .IORQ_n(cpu2_IORQ_n),
