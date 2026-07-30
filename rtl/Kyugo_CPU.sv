@@ -230,7 +230,43 @@ wire nmi_mask = mainlatch[0];   // REAL: the game controls its own vblank-NMI en
 //     is live and testable. (2) sprite draw has ZERO flip_screen handling at all (MAME
 //     mirrors sprite Y, inverts per-sprite flipX/flipY, reverses row-stacking order when
 //     flipped) — if sprites look wrong after this compile, that's why.
-wire flip_screen = mainlatch[1];
+// ============================================================================================
+// FLIP-PATH-BYPASS-2026-07-29 — READ THIS BEFORE "FIXING" flip_screen AGAIN.
+//
+// `flip_screen` is forced to 0 ON PURPOSE. Everything above this line about mainlatch[1] is
+// factually correct — Gyrodine really does set it at $7E92, our LS259 decode really is right,
+// MAME really does honour it. The conclusion drawn from those facts was still wrong.
+//
+// WHY IT IS FORCED OFF: a 180 degree flip and the screen rotation COMMUTE, so
+//     render-unflipped + rotate CCW   ==   render-flipped + rotate CW
+// Both give the identical, correct final image. The first uses the exact same render path as
+// SRD Mission / Repulse / Flashgal — proven, five games stable on it. The second is the only
+// path Gyrodine ever took, and it has NEVER produced a correct frame in any compile.
+//
+// EVIDENCE (HW, 2026-07-29): with mainlatch[1] honoured and the flip-path maths made fully
+// self-consistent (FLIP-LAYERS-FIX-2026-07-29 (a)-(e), still present below and still believed
+// correct), Gyrodine rendered a clean 180 degree rotation with MANGLED TEXT — broken glyph
+// rows on every character — while SRD Mission, running byte-identical graphics code with
+// flip_screen=0, was perfect. flip_screen is the ONLY difference between them in the whole
+// video path, which localises the remaining corruption to the flip branches themselves.
+//
+// So: enter the proven path, and let the rotation stage absorb the 180 degrees. That means
+// Gyrodine.mra must stay at rot_flip=0 (core_config bit 3 clear, index=1 part 00) => CCW.
+// The two settings are a MATCHED PAIR. Changing one without the other puts Gyrodine 180 out.
+//
+// This restores the pre-2026-07-01 configuration, which is the last one known to render
+// Gyrodine correctly. FLIP-SCREEN-FIX-2026-07-01 was therefore a regression: it was right
+// about the hardware and wrong about what to do with it.
+//
+// The (a)-(e) flip-path fixes are deliberately LEFT IN, dormant. They only matter when
+// flip_screen==1, which now never happens. Live cocktail flip (Flashgal toggles the bit at
+// $1342/$1369) is the one case that would need them, and it needs the flip path debugged
+// first — separate job, not required by any of the 8 games' normal operation.
+//
+// DIAG-REVERT-2026-07-29: original below
+// wire flip_screen = mainlatch[1];
+// ============================================================================================
+wire flip_screen = 1'b0;
 wire cpu2_rst    = ~mainlatch[2];
 
 //------------------------------------------------------- Watchdog (Gyrodine) -------------------------------------------------//
@@ -567,8 +603,17 @@ eprom_32b prom_tim_rom (.CLK(clk_49m), .ADDR(5'd0), .CLK_DL(clk_49m),
 //----------------------------------------------- BG render pipeline -------------------------------------------------//
 
 // Screen coords (with flip)
+// FLIP-LAYERS-FIX-2026-07-29 (a): the vertical mirror constant was wrong. The visible window is
+// v_cnt 16..239 (`vblk = v_cnt<16 | v_cnt>=240`, Kyugo_CPU.sv:99) — it does NOT start at 0 the way
+// the horizontal one does (`hblk = base_h_cnt>=288` ⇒ visible 0..287). Mirroring a window [lo,hi]
+// about its own centre is `(lo+hi) - x`, so X is correctly `287 - base_h_cnt` (0+287) but Y must be
+// `255 - v_cnt` (16+239), not `239 - v_cnt`. As written, enabling flip_screen ALSO shifted the whole
+// BG up by exactly 16 lines = 2 tile rows. Unflipped path untouched (bit-identical).
+// DIAG-REVERT-2026-07-29: originals below
+// wire [8:0] bg_sx = flip_screen ? (9'd287 - base_h_cnt) : base_h_cnt;
+// wire [8:0] bg_sy = flip_screen ? (9'd239 - v_cnt)      : v_cnt;
 wire [8:0] bg_sx = flip_screen ? (9'd287 - base_h_cnt) : base_h_cnt;
-wire [8:0] bg_sy = flip_screen ? (9'd239 - v_cnt)      : v_cnt;
+wire [8:0] bg_sy = flip_screen ? (9'd255 - v_cnt)      : v_cnt;
 
 // World coords (BG has set_scrolldx(-32) → +32 in world space when not flipped)
 wire [8:0] scroll_x_full = {scroll_x_hi, scroll_x_lo};
@@ -614,7 +659,11 @@ wire [2:0] bg_fy  = bg_world_y[2:0];
 wire bg_row_lookahead = (base_h_cnt >= 9'd389);   // covers both sequences (FG starts earliest, at 389)
 
 wire [8:0] v_cnt_next      = (v_cnt == 9'd259) ? 9'd0 : (v_cnt + 9'd1);
-wire [8:0] bg_sy_next      = flip_screen ? (9'd239 - v_cnt_next) : v_cnt_next;
+// FLIP-LAYERS-FIX-2026-07-29 (a, cont): same 16-line mirror-constant fix as bg_sy above. Must track
+// bg_sy exactly or the lookahead-fetched column 0 disagrees with the rest of the line when flipped.
+// DIAG-REVERT-2026-07-29: original below
+// wire [8:0] bg_sy_next      = flip_screen ? (9'd239 - v_cnt_next) : v_cnt_next;
+wire [8:0] bg_sy_next      = flip_screen ? (9'd255 - v_cnt_next) : v_cnt_next;
 wire [8:0] bg_world_y_next = bg_sy_next + {1'b0, scroll_y_r};
 wire [4:0] bg_row_next     = bg_world_y_next[7:3];
 
@@ -683,11 +732,27 @@ always_ff @(posedge clk_49m) begin
                 9'd391: begin
                     bg_code_nxt      <= {bgattr_rD[1:0], bgvram_rD};
                     bg_color_nxt     <= {bgpalbank, bgattr_rD[7:4]};
-                    bg_fx_invert_nxt <= bgattr_rD[2] ^ flip_screen;
-                    bg_fy_eff        <= bg_fetch_fy ^ {3{bgattr_rD[3] ^ flip_screen}};
-                    bg0_addr <= {1'b0, {bgattr_rD[1:0], bgvram_rD}, (bg_fetch_fy ^ {3{bgattr_rD[3] ^ flip_screen}})};
-                    bg1_addr <= {1'b0, {bgattr_rD[1:0], bgvram_rD}, (bg_fetch_fy ^ {3{bgattr_rD[3] ^ flip_screen}})};
-                    bg2_addr <= {1'b0, {bgattr_rD[1:0], bgvram_rD}, (bg_fetch_fy ^ {3{bgattr_rD[3] ^ flip_screen}})};
+                    // FLIP-LAYERS-FIX-2026-07-29 (b): the `^ flip_screen` terms here were a DOUBLE flip
+                    // that cancelled the screen mirror. We implement flip by mirroring the screen
+                    // COORDINATE (bg_sx/bg_sy above), so when flipped bg_world_x/y COUNT BACKWARDS as
+                    // the raster advances — which already reverses both the tile ORDER and the
+                    // pixel/line order WITHIN each tile, for free. XOR-ing flip_screen into the
+                    // fx-invert and fine-Y terms mirrored each tile a SECOND time, un-mirroring it:
+                    // net result was reversed tile order with individually un-reversed tiles (and the
+                    // matching line-order error vertically). Per-tile attr flips (bit2=flipX,
+                    // bit3=flipY, MAME get_bg_tile_info) still apply — only the screen-flip XOR goes.
+                    // Unflipped path bit-identical (x ^ 0 == x).
+                    // DIAG-REVERT-2026-07-29: originals below
+                    // bg_fx_invert_nxt <= bgattr_rD[2] ^ flip_screen;
+                    // bg_fy_eff        <= bg_fetch_fy ^ {3{bgattr_rD[3] ^ flip_screen}};
+                    // bg0_addr <= {1'b0, {bgattr_rD[1:0], bgvram_rD}, (bg_fetch_fy ^ {3{bgattr_rD[3] ^ flip_screen}})};
+                    // bg1_addr <= {1'b0, {bgattr_rD[1:0], bgvram_rD}, (bg_fetch_fy ^ {3{bgattr_rD[3] ^ flip_screen}})};
+                    // bg2_addr <= {1'b0, {bgattr_rD[1:0], bgvram_rD}, (bg_fetch_fy ^ {3{bgattr_rD[3] ^ flip_screen}})};
+                    bg_fx_invert_nxt <= bgattr_rD[2];
+                    bg_fy_eff        <= bg_fetch_fy ^ {3{bgattr_rD[3]}};
+                    bg0_addr <= {1'b0, {bgattr_rD[1:0], bgvram_rD}, (bg_fetch_fy ^ {3{bgattr_rD[3]}})};
+                    bg1_addr <= {1'b0, {bgattr_rD[1:0], bgvram_rD}, (bg_fetch_fy ^ {3{bgattr_rD[3]}})};
+                    bg2_addr <= {1'b0, {bgattr_rD[1:0], bgvram_rD}, (bg_fetch_fy ^ {3{bgattr_rD[3]}})};
                 end
                 9'd392: begin
                     bg_p0_nxt <= bg0_D;
@@ -715,11 +780,19 @@ always_ff @(posedge clk_49m) begin
                     // BG-FLIP-SWAP-FIX-2026-06-12: MAME get_bg_tile_info uses TILE_FLIPYX((attr&0x0c)>>2) ⇒
                     // flipX = attr BIT 2, flipY = attr BIT 3. We had them swapped (bit3/bit2 = the SPRITE
                     // convention), mirroring BG tiles on the wrong axis. (FG has no per-tile flip — correct.)
-                    bg_fx_invert_nxt <= bgattr_rD[2] ^ flip_screen;            // flipX = attr bit 2 (MAME)
-                    bg_fy_eff        <= bg_fetch_fy ^ {3{bgattr_rD[3] ^ flip_screen}}; // flipY = attr bit 3 (MAME)
-                    bg0_addr <= {1'b0, {bgattr_rD[1:0], bgvram_rD}, (bg_fetch_fy ^ {3{bgattr_rD[3] ^ flip_screen}})};
-                    bg1_addr <= {1'b0, {bgattr_rD[1:0], bgvram_rD}, (bg_fetch_fy ^ {3{bgattr_rD[3] ^ flip_screen}})};
-                    bg2_addr <= {1'b0, {bgattr_rD[1:0], bgvram_rD}, (bg_fetch_fy ^ {3{bgattr_rD[3] ^ flip_screen}})};
+                    // FLIP-LAYERS-FIX-2026-07-29 (b, cont): same double-flip removal as the lookahead
+                    // block above — see that comment for the full reasoning. Must match it exactly.
+                    // DIAG-REVERT-2026-07-29: originals below
+                    // bg_fx_invert_nxt <= bgattr_rD[2] ^ flip_screen;            // flipX = attr bit 2 (MAME)
+                    // bg_fy_eff        <= bg_fetch_fy ^ {3{bgattr_rD[3] ^ flip_screen}}; // flipY = attr bit 3 (MAME)
+                    // bg0_addr <= {1'b0, {bgattr_rD[1:0], bgvram_rD}, (bg_fetch_fy ^ {3{bgattr_rD[3] ^ flip_screen}})};
+                    // bg1_addr <= {1'b0, {bgattr_rD[1:0], bgvram_rD}, (bg_fetch_fy ^ {3{bgattr_rD[3] ^ flip_screen}})};
+                    // bg2_addr <= {1'b0, {bgattr_rD[1:0], bgvram_rD}, (bg_fetch_fy ^ {3{bgattr_rD[3] ^ flip_screen}})};
+                    bg_fx_invert_nxt <= bgattr_rD[2];                           // flipX = attr bit 2 (MAME)
+                    bg_fy_eff        <= bg_fetch_fy ^ {3{bgattr_rD[3]}};        // flipY = attr bit 3 (MAME)
+                    bg0_addr <= {1'b0, {bgattr_rD[1:0], bgvram_rD}, (bg_fetch_fy ^ {3{bgattr_rD[3]}})};
+                    bg1_addr <= {1'b0, {bgattr_rD[1:0], bgvram_rD}, (bg_fetch_fy ^ {3{bgattr_rD[3]}})};
+                    bg2_addr <= {1'b0, {bgattr_rD[1:0], bgvram_rD}, (bg_fetch_fy ^ {3{bgattr_rD[3]}})};
                 end
                 3'd2: begin
                     bg_p0_nxt <= bg0_D;
@@ -961,15 +1034,44 @@ wire signed [10:0] sx_calc = (sx_pre > 9'd320) ? ($signed({2'd0, sx_pre}) - 11's
                                                 : $signed({2'd0, sx_pre});
 
 // Row hit (in SS_FR0): diff = eval_y - sy_full (9-bit two's complement); hit if diff[8:8]=0 (positive)
-wire [8:0] hit_diff = {1'b0, eval_y} - sy_full;
+// FLIP-LAYERS-FIX-2026-07-29 (c): sprite row-STACKING direction was missing. MAME draws cell row y at
+// `sx, flip ? sy - 16*y : sy + 16*y` (kyugo.cpp:401) — when flipped, the 16 cells of a sprite stack
+// UPWARD from sy instead of downward. Our per-scanline evaluator encodes stacking as
+// diff = eval_y - sy (cell index = diff[7:4], line-within-cell = diff[3:0]), so the mirrored form is
+// diff_f = (sy + 15) - eval_y, with line-within-cell becoming 15 - diff_f[3:0]:
+//   eval_y = sy      -> diff_f = 15 -> cell 0, yint  0   (cell 0 top    = sy)     OK
+//   eval_y = sy + 15 -> diff_f =  0 -> cell 0, yint 15   (cell 0 bottom = sy+15)  OK
+//   eval_y = sy -  1 -> diff_f = 16 -> cell 1, yint 15   (cell 1 bottom = sy-1)   OK
+//   eval_y = sy - 16 -> diff_f = 31 -> cell 1, yint  0   (cell 1 top    = sy-16)  OK
+// This is the RAW line-within-cell; the per-sprite flipy mirror is applied downstream by
+// y_eff_now/y_eff_lat, so there is no double-application.
+// Deliberately kept at 9 bits: a true diff of 256..270 is out of range (a sprite is only 16 cells)
+// and the natural 9-bit wrap makes it read negative -> miss, the same property the unflipped path
+// already relies on. Widening to 10 bits would truncate cell index 16 to 0 and fake a hit.
+// DIAG-REVERT-2026-07-29: originals below
+// wire [8:0] hit_diff = {1'b0, eval_y} - sy_full;
+// wire       hit      = (hit_diff[8] == 1'b0);
+// wire [3:0] hit_row  = hit_diff[7:4];
+// wire [3:0] hit_yint = hit_diff[3:0];
+wire [8:0] hit_diff_norm = {1'b0, eval_y} - sy_full;
+wire [8:0] hit_diff_flip = (sy_full + 9'd15) - {1'b0, eval_y};
+wire [8:0] hit_diff = flip_screen ? hit_diff_flip : hit_diff_norm;
 wire       hit      = (hit_diff[8] == 1'b0);
 wire [3:0] hit_row  = hit_diff[7:4];
-wire [3:0] hit_yint = hit_diff[3:0];
+wire [3:0] hit_yint = flip_screen ? (4'd15 - hit_diff[3:0]) : hit_diff[3:0];
 
 // Sprite code/flip from BRAM in SS_FR1 (combinational from BRAM outputs)
 wire [9:0] code_now  = {spram1_rD[0], spram1_rD[1], fgvram_spr_rD};
-wire       flipx_now = spram1_rD[3];
-wire       flipy_now = spram1_rD[2];
+// FLIP-LAYERS-FIX-2026-07-29 (d): per-sprite flip attributes must INVERT when the screen is flipped
+// (MAME kyugo.cpp:391-395 `if (flip) { flipx = !flipx; flipy = !flipy; }`). Unlike the BG — which
+// gets its mirror for free from the flipped screen coordinate — the sprite engine addresses gfx by
+// sprite-relative x/y (px_idx / y_in_tile), so nothing mirrors a sprite cell unless we ask.
+// Unflipped path bit-identical (x ^ 0 == x).
+// DIAG-REVERT-2026-07-29: originals below
+// wire       flipx_now = spram1_rD[3];
+// wire       flipy_now = spram1_rD[2];
+wire       flipx_now = spram1_rD[3] ^ flip_screen;
+wire       flipy_now = spram1_rD[2] ^ flip_screen;
 wire [3:0] y_eff_now = flipy_now ? (4'd15 - y_in_tile) : y_in_tile;
 wire [3:0] y_eff_lat = flipy_lat ? (4'd15 - y_in_tile) : y_in_tile;
 
@@ -1039,7 +1141,14 @@ always_ff @(posedge clk_49m) begin
                 SS_FS1W: spr_st <= SS_FS2;                  // wait
                 SS_FS2: begin
                     color_lat <= spram0_rD[4:0];
-                    sy_full   <= sy_calc;
+                    // FLIP-LAYERS-FIX-2026-07-29 (e): sprite Y mirror. MAME applies `if (flip) sy = 240 - sy;`
+                    // AFTER the 257-raw wrap (kyugo.cpp:376-377), so it goes here, on sy_calc, not on
+                    // sy_y_raw. NOTE: MAME does NOT mirror sprite X when flipped — sx is passed through
+                    // unchanged at kyugo.cpp:401 — so sx_full stays as-is. That asymmetry looks odd but it
+                    // is what the reference does; replicating it exactly, revisit only if HW disagrees.
+                    // DIAG-REVERT-2026-07-29: original below
+                    // sy_full   <= sy_calc;
+                    sy_full   <= flip_screen ? (9'd240 - sy_calc) : sy_calc;
                     sx_full   <= sx_calc;
                     spr_st    <= SS_FR0;
                 end

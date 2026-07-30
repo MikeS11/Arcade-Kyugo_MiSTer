@@ -40,6 +40,16 @@
 	</switches>
 
 	<!-- Index 1: variant selector (0 = Gyrodine) -->
+	<!-- core_config: bits[2:0]=variant_sel (0=VAR_GYRO), bit3=rot_flip, bit4=no_rotate (ROT0 sets) -->
+	<!-- rot_flip=0 (bit3 clear) => rotate CCW. This is a MATCHED PAIR with FLIP-PATH-BYPASS-2026-07-29
+	     in rtl/Kyugo_CPU.sv, which forces the render's flip_screen to 0. A 180 degree flip and the
+	     rotation commute, so unflipped-render + CCW == flipped-render + CW; we take the unflipped one
+	     because that is the same proven render path SRD Mission and Repulse use, and Gyrodine's flip
+	     path has never rendered correctly. Do NOT set bit 3 here without also un-forcing flip_screen
+	     in the RTL, or Gyrodine lands 180 degrees out. Gyrodine is intentionally the only ROT90 set
+	     with bit3 clear; Repulse (09) and SRD Mission (0B) set it because they never assert flip.
+	     Tried and reverted 2026-07-29: part 08 (rot_flip=1/CW) with flip_screen honoured — correct
+	     orientation but mangled text, since it routes Gyrodine through the broken flip branches. -->
 	<rom index="1">
 		<part>00</part>
 	</rom>
