@@ -71,10 +71,6 @@
 		<!-- Sprite plane 2 32KB -->
 		<part crc="d110e140" name="12.10a"/>
 		<part crc="8fdc713c" name="13.11a"/>
-		<!-- Color PROMs: load in MAME's ROM_START order (b.1j, g.1h, r.1f), NOT chip-label R,G,B order.
-		     RGB_444_PROMS decodes positionally (1st block=red, 2nd=green, 3rd=blue) regardless of the
-		     physical chip's silkscreen label; a prior "fix" reordered these to r.1f/g.1h/b.1j to match
-		     the labels, which swapped red and blue vs MAME (2026-08-01: ocean blue->red, ground teal->brown). -->
 		<part crc="3ea35431" name="b.1j"/>
 		<part crc="acd7a69e" name="g.1h"/>
 		<part crc="b7f48b41" name="r.1f"/>
