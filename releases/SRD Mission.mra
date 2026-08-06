@@ -7,6 +7,7 @@
 
 	<setname>srdmissn</setname>
 	<rbf>Kyugo</rbf>
+    <mameversion>0268</mameversion>
 
 	<resolution>15kHz</resolution>
 	<rotation>vertical (cw)</rotation>

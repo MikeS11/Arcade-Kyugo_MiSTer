@@ -13,7 +13,7 @@
 
 	<setname>gyrodine</setname>
 	<parent>gyrodine</parent>
-	<mameversion>0220</mameversion>
+    <mameversion>0268</mameversion>
 	<rbf>Kyugo</rbf>
 	<about></about>
 
