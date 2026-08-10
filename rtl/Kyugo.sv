@@ -51,6 +51,7 @@ module Kyugo
 
 	// Screen centering
 	input          [3:0] h_center, v_center,
+	input                video_mode,
 
 	// ROM loading
 	input         [24:0] ioctl_addr,
@@ -132,6 +133,7 @@ Kyugo_CPU main_pcb
 
 	.h_center(h_center),
 	.v_center(v_center),
+	.video_mode(video_mode),
 
 	.main_rom_cs_i(main_rom_cs_i),
 	.sub_rom_cs_i(sub_rom_cs_i),

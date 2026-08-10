@@ -6,7 +6,7 @@
 //  MAME reference: kyugo.cpp
 //  Hardware: Z80 CPU1 + Z80 CPU2 @ 3.072 MHz (XTAL 18.432 / 6)
 //            2x AY-3-8910 @ 1.536 MHz (18.432 / 12)
-//  Screen: 396x260 total, visible 288x224 (lines 16-239), 59.66 Hz
+//  Screen: original 396x260 or NTSC 390x263, visible 288x224 (lines 16-239)
 //
 //============================================================================
 
@@ -25,6 +25,7 @@ module Kyugo_CPU
     input         rot_flip,
 	output signed [15:0] sound,
 	input   [3:0] h_center, v_center,
+	input         video_mode,
 	input         main_rom_cs_i, sub_rom_cs_i, fg_rom_cs_i,
 	input         bg0_rom_cs_i, bg1_rom_cs_i, bg2_rom_cs_i,
 	input         spr0_rom_cs_i, spr1_rom_cs_i, spr2_rom_cs_i,
@@ -66,6 +67,10 @@ wire cen_ay = cen_cpu & ~ay_toggle & ~pause;
 
 reg [8:0] base_h_cnt = 9'd0;
 reg [8:0] v_cnt      = 9'd0;
+reg       ntsc_active = 1'b0;
+
+wire [8:0] h_last = ntsc_active ? 9'd389 : 9'd395;
+wire [8:0] v_last = ntsc_active ? 9'd262 : 9'd259;
 
 wire [8:0] h_cnt_rot;
 wire [8:0] v_cnt_rot;
@@ -76,10 +81,15 @@ assign h_cnt_rot = { base_h_cnt[8], base_h_cnt[7:0] ^ {8{flip_screen}} };
 assign v_cnt_rot = { v_cnt[8],      v_cnt[7:0]      ^ {8{flip_screen}} };
 
 always_ff @(posedge clk_49m) begin
+	// Change totals only at frame origin. Keeping the current total throughout reset also avoids
+	// moving v_last behind v_cnt when reset is asserted during NTSC-only lines 260..262.
+	if (reset && cen_pix && base_h_cnt == 9'd0 && v_cnt == 9'd0)
+		ntsc_active <= video_mode;
+
 	if (cen_pix) begin
-		if (base_h_cnt == 9'd395) begin
+		if (base_h_cnt == h_last) begin
 			base_h_cnt <= 9'd0;
-			v_cnt <= (v_cnt == 9'd259) ? 9'd0 : v_cnt + 9'd1;
+			v_cnt <= (v_cnt == v_last) ? 9'd0 : v_cnt + 9'd1;
 		end else begin
 			base_h_cnt <= base_h_cnt + 9'd1;
 		end
@@ -91,11 +101,19 @@ wire vblk = (v_cnt < 9'd16) | (v_cnt >= 9'd240);
 assign video_hblank = hblk;
 assign video_vblank = vblk;
 
-// HSYNC/VSYNC generation; h_center/v_center are OSD-adjustable centering offsets.
-wire [8:0] hs_start = 9'd292 + {5'd0, h_center};
-wire [8:0] hs_end   = hs_start + 9'd16;
-wire [8:0] vs_start = 9'd242 + {5'd0, v_center};
-wire [8:0] vs_end   = vs_start + 9'd4;
+// The position menus encode values 1..7 as -1..-7 and values 8..14 as +7..+1.
+wire [8:0] hs_base   = ntsc_active ? 9'd317 : 9'd325;
+wire [8:0] hs_width  = ntsc_active ? 9'd25  : 9'd16;
+wire [8:0] hs_adjust = h_center[3] ? (9'd15 - {5'd0, h_center}) : {5'd0, h_center};
+wire [8:0] hs_start  = h_center[3] ? (hs_base - hs_adjust) : (hs_base + hs_adjust);
+wire [8:0] hs_end    = hs_start + hs_width;
+
+// Default halfway between the board's original sync position and the balanced-porch position.
+// This gives seven menu steps in either direction without moving sync outside vertical blanking.
+wire [8:0] vs_base   = ntsc_active ? 9'd250 : 9'd249;
+wire [8:0] vs_adjust = v_center[3] ? (9'd15 - {5'd0, v_center}) : {5'd0, v_center};
+wire [8:0] vs_start  = v_center[3] ? (vs_base - vs_adjust) : (vs_base + vs_adjust);
+wire [8:0] vs_end    = vs_start + 9'd4;
 assign video_hsync = (h_cnt_sync >= hs_start && h_cnt_sync < hs_end);
 assign video_vsync = (v_cnt_sync >= vs_start && v_cnt_sync < vs_end);
 assign video_csync = ~(video_hsync ^ video_vsync);
@@ -569,13 +587,10 @@ wire [4:0] bg_row = bg_world_y[7:3];   // 0..31
 wire [2:0] bg_fx  = bg_world_x[2:0];   // 0..7
 wire [2:0] bg_fy  = bg_world_y[2:0];
 
-// BG tile fetch pipeline runs one tile (8 pixels) behind what's displayed, driven by bg_fx during
-// normal display. base_h_cnt's total period (396, kyugo.cpp:946 screen.set_raw(...,396,0,288,260,
-// 16,240)) is not a multiple of 8, and v_cnt only increments on the same tick base_h_cnt wraps
-// 395->0 -- too late for column 0 of the new row to be ready via the normal same-row fetch. This
-// window re-primes the pipeline early, during the last part of hblank, so the first tile of the
-// new row is ready by base_h_cnt==0.
-//
+// BG tile fetch pipeline runs one tile (8 pixels) behind what's displayed. The final 12 clocks of
+// hblank re-prime the pipeline for the next row. Referencing them to h_last keeps the active area
+// identical in both the original 396-pixel line and the NTSC 390-pixel line.
+// Original H-cnt
 // bg_row_lookahead spans base_h_cnt 384..395. Two fetches happen back-to-back, sequenced directly
 // by base_h_cnt (not by bg_fx, which drifts against base_h_cnt with scroll and would otherwise make
 // the window's effective timing scroll-phase-dependent):
@@ -588,11 +603,18 @@ wire [2:0] bg_fy  = bg_world_y[2:0];
 //   390: latch plane data into _nxt -- left there for the line's first fx==7 to promote
 //   391-395: idle -- must NOT promote here, or the freshly primed _nxt (col_zero+1) is clobbered
 //            before the normal per-tile sequence gets to use it.
+// Update h_cnt to add 60hz mode
+// Two fetches happen back-to-back, sequenced by lookahead_phase rather than absolute hcount:
+//   0..3: fetch and promote col_zero for pixel 0 of the upcoming row
+//   4..6: fetch col_zero+1 into _nxt
+//   7..11: idle; _nxt must survive until the normal pipeline promotes it
 // This keeps the steady-state invariant (_lat = currently displayed tile, _nxt = next tile) true
 // at base_h_cnt==0, for every scroll phase.
-wire bg_row_lookahead = (base_h_cnt >= 9'd384);
+wire [8:0] bg_lookahead_start = h_last - 9'd11;
+wire       bg_row_lookahead = (base_h_cnt >= bg_lookahead_start);
+wire [3:0] lookahead_phase = base_h_cnt - bg_lookahead_start;
 
-wire [8:0] v_cnt_next      = (v_cnt == 9'd259) ? 9'd0 : (v_cnt + 9'd1);
+wire [8:0] v_cnt_next      = (v_cnt == v_last) ? 9'd0 : (v_cnt + 9'd1);
 // Same mirror constant as bg_sy (255, not 239) -- must track it exactly or the lookahead-fetched
 // column 0 disagrees with the rest of the line once flipped.
 wire [8:0] bg_sy_next      = flip_screen ? (9'd255 - v_cnt_next) : v_cnt_next;
@@ -640,19 +662,19 @@ reg  [7:0] bg_p0_lat, bg_p1_lat, bg_p2_lat;
 always_ff @(posedge clk_49m) begin
     if (cen_pix) begin
         if (bg_row_lookahead) begin
-            case (base_h_cnt)
-                // Two fetches happen here, not one: the first (384-387) promotes col_zero straight
-                // into _lat so it's ready to display at base_h_cnt==0; the second (388-390) primes
+            case (lookahead_phase)
+                // Two fetches happen here, not one: the first (0-3) promotes col_zero straight
+                // into _lat so it's ready to display at base_h_cnt==0; the second (4-6) primes
                 // _nxt with col_zero+1 so the mid-line invariant (_lat = displayed tile, _nxt = next
                 // tile) already holds by the time the line's first fx==7 promotes it. A single fetch
                 // would leave _nxt also holding col_zero with no pending fetch for col_zero+1, so the
                 // first fx==7 of the line (at base_h_cnt = 7-phi, phi = (scroll_x+32) mod 8, which
                 // drifts with scroll) would re-promote the same stale tile.
-                9'd384: begin
+                4'd0: begin
                     bgvram_raddr <= {bg_fetch_row, bg_fetch_col};
                     bgattr_raddr <= {bg_fetch_row, bg_fetch_col};
                 end
-                9'd385: begin
+                4'd1: begin
                     bg_code_nxt      <= {bgattr_rD[1:0], bgvram_rD};
                     bg_color_nxt     <= {bgpalbank, bgattr_rD[7:4]};
                     // flip_screen is intentionally NOT XORed into fx-invert/fine-Y here. Flip is
@@ -668,13 +690,13 @@ always_ff @(posedge clk_49m) begin
                     bg1_addr <= {1'b0, {bgattr_rD[1:0], bgvram_rD}, (bg_fetch_fy ^ {3{bgattr_rD[3]}})};
                     bg2_addr <= {1'b0, {bgattr_rD[1:0], bgvram_rD}, (bg_fetch_fy ^ {3{bgattr_rD[3]}})};
                 end
-                9'd386: begin
+                4'd2: begin
                     bg_p0_nxt <= bg0_D;
                     bg_p1_nxt <= bg1_D;
                     bg_p2_nxt <= bg2_D;
                 end
                 // promote fetch #1 (col_zero) into _lat — must happen BEFORE fetch #2 overwrites _nxt
-                9'd387: begin
+                4'd3: begin
                     bg_color_lat     <= bg_color_nxt;
                     bg_fx_invert_lat <= bg_fx_invert_nxt;
                     bg_p0_lat        <= bg_p0_nxt;
@@ -683,11 +705,11 @@ always_ff @(posedge clk_49m) begin
                 end
                 // fetch #2 = col_zero+1, left in _nxt for the line's first fx==7 to promote.
                 // +1 wraps mod 64, which is correct for the 64-tile-wide BG map.
-                9'd388: begin
+                4'd4: begin
                     bgvram_raddr <= {bg_fetch_row, (bg_col_zero + 6'd1)};
                     bgattr_raddr <= {bg_fetch_row, (bg_col_zero + 6'd1)};
                 end
-                9'd389: begin
+                4'd5: begin
                     bg_code_nxt      <= {bgattr_rD[1:0], bgvram_rD};
                     bg_color_nxt     <= {bgpalbank, bgattr_rD[7:4]};
                     bg_fx_invert_nxt <= bgattr_rD[2];
@@ -696,12 +718,12 @@ always_ff @(posedge clk_49m) begin
                     bg1_addr <= {1'b0, {bgattr_rD[1:0], bgvram_rD}, (bg_fetch_fy ^ {3{bgattr_rD[3]}})};
                     bg2_addr <= {1'b0, {bgattr_rD[1:0], bgvram_rD}, (bg_fetch_fy ^ {3{bgattr_rD[3]}})};
                 end
-                9'd390: begin
+                4'd6: begin
                     bg_p0_nxt <= bg0_D;
                     bg_p1_nxt <= bg1_D;
                     bg_p2_nxt <= bg2_D;
                 end
-                default: ; // 391-395 idle: no promote here, _lat/_nxt must survive to base_h_cnt==0
+                default: ; // phases 7-11 idle: preserve _nxt until the next line
             endcase
         end else begin
             case (bg_fx)
@@ -794,29 +816,29 @@ always_ff @(posedge clk_49m) begin
     if (cen_pix) begin
         // Same reasoning as the BG pipeline above: during the lookahead window this is sequenced by
         // base_h_cnt directly (fixed ticks every line) instead of fg_fx, and promotes at the latest
-        // possible tick (395) for maximum freshness.
-        if (bg_row_lookahead) begin
-            case (base_h_cnt)
-                9'd389: fgvram_raddr <= {fg_fetch_row, fg_fetch_col};
-                9'd390: begin
+        // possible tick (lookahead phase 11) for maximum freshness.
+		if (bg_row_lookahead) begin
+			case (lookahead_phase)
+				4'd5: fgvram_raddr <= {fg_fetch_row, fg_fetch_col};
+				4'd6: begin
                     fg_code_nxt   <= fgvram_rD;
                     prom_lut_addr <= fgvram_rD[7:3];
                 end
-                9'd391: begin
+				4'd7: begin
                     fg_color_nxt <= {prom_lut_D[4:0], fgcolor};
                     fgtile_addr  <= {fg_code_nxt, 1'b0, fg_fetch_fy};
                 end
-                9'd392: begin
+				4'd8: begin
                     fg_byte_l_nxt <= fgtile_D;
                     fgtile_addr   <= {fg_code_nxt, 1'b1, fg_fetch_fy};
                 end
-                9'd393: fg_byte_r_nxt <= fgtile_D;
-                9'd395: begin
+				4'd9: fg_byte_r_nxt <= fgtile_D;
+				4'd11: begin
                     fg_color_lat  <= fg_color_nxt;
                     fg_byte_l_lat <= fg_byte_l_nxt;
                     fg_byte_r_lat <= fg_byte_r_nxt;
                 end
-                default: ; // idle (388-389 unused)
+				default: ;
             endcase
         end else begin
             case (fg_fx)
@@ -876,7 +898,7 @@ reg       write_buf;            // 0 → write A / read B; 1 → write B / read 
 reg       eol_d;
 always_ff @(posedge clk_49m) begin
     if (cen_pix) begin
-        eol_d <= (base_h_cnt == 9'd395);
+		eol_d <= (base_h_cnt == h_last);
         if (eol_d) write_buf <= ~write_buf;
     end
 end
